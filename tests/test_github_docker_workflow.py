@@ -24,11 +24,9 @@ def test_docker_images_workflow_publishes_runtime_and_playwright_images():
     assert permissions["packages"] == "write"
     checkout = workflow_jobs["build-and-push"]["steps"][0]
     assert checkout["uses"] == "actions/checkout@v4"
-    populate = workflow_jobs["build-and-push"]["steps"][1]
-    assert populate["name"] == "Populate analyzer source"
-    assert "https://github.com/atsud0/SXF_extract_attacker.git" in populate["run"]
-    assert "--branch main" in populate["run"]
-    assert "c5ae8879ac34c3b13e8a0c49d1ef5f7d3c95b0fc" in populate["run"]
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert "SXF_extract_attacker.git" not in workflow_text
+    assert "codeload.github.com/atsud0" not in workflow_text
 
 
 def test_compose_uses_prebuilt_ghcr_images_for_all_services():
