@@ -170,6 +170,8 @@ class PipelineRunner:
                 command = [
                     sys.executable,
                     str(self.config.root_dir / "situation-awareness" / "sangfor_login_session.py"),
+                    "--base-url",
+                    self.config.sip_base_url,
                     "--session-file",
                     str(self.config.paths.sip_session_file),
                 ]
@@ -189,6 +191,8 @@ class PipelineRunner:
                 command = [
                     sys.executable,
                     str(self.config.root_dir / "firewall" / "sangfor_firewall_login_session.py"),
+                    "--base-url",
+                    self.config.firewall_base_url,
                     "--session-file",
                     str(self.config.paths.firewall_session_file),
                 ]

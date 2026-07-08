@@ -26,7 +26,7 @@ if __package__ in {None, ""}:
 from pipeline.login_credentials import load_login_credentials, recognize_captcha_with_chaojiying
 from pipeline.playwright_browser import chromium_launch_options
 
-DEFAULT_BASE_URL = "https://172.16.1.116"
+DEFAULT_BASE_URL = "https://firewall.local"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_FILE = PROJECT_ROOT / "secrets" / "firewall_session.json"
 DEFAULT_CAPTCHA_FILE = Path("/tmp/sangfor-firewall-login-captcha.png")

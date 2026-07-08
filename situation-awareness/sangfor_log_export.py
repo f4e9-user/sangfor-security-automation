@@ -15,7 +15,7 @@ from urllib.parse import urlencode, urlparse
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
-DEFAULT_BASE_URL = "https://172.16.1.118"
+DEFAULT_BASE_URL = "https://sip.local"
 DEFAULT_OUTPUT_DIR = Path.home() / "sangfor-exports"
 DEFAULT_SESSION_FILE = Path.home() / ".config" / "sangfor" / "session.json"
 DEFAULT_KEY_FIELDS = "record_time,depict,module_type,attack_type,src_ip,src_classify1_id,src_port,dst_ip,dst_classify1_id,dst_port,level,net_action,status_code,dev_id,in_dev,attack_state,is_white,proxy"
@@ -63,7 +63,7 @@ def build_output_name(export_date: str | date, sequence: int) -> str:
     return f"sangfor-sip-report-KsearchLog-{parsed:%Y%m%d}{sequence:02d}.xlsx"
 
 
-def parse_cookie_header(raw: str, domain: str = "172.16.1.118") -> list[dict]:
+def parse_cookie_header(raw: str, domain: str = "sip.local") -> list[dict]:
     cookies = []
     for part in raw.split(";"):
         part = part.strip()
@@ -309,7 +309,7 @@ class SangforExporter:
 
 def make_context(browser, base_url: str, cookie_header: str) -> BrowserContext:
     parsed = urlparse(base_url)
-    domain = parsed.hostname or "172.16.1.118"
+    domain = parsed.hostname or "sip.local"
     context = browser.new_context(ignore_https_errors=True, accept_downloads=True)
     context.add_cookies(parse_cookie_header(cookie_header, domain=domain))
     return context

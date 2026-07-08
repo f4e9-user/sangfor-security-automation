@@ -35,8 +35,9 @@ def test_redaction_removes_headers_json_fields_and_cli_values():
     payload = (
         "Cookie: SESSID=abc; Set-Cookie: token=def\n"
         "Authorization: Bearer bearer-secret\n"
-        '{"cookie": "secret-cookie", "xid": "secret-xid", "csrf": {"_cftoken": "csrf-secret"}, "api_key": "key"}\n'
-        "cmd --cookie raw-cookie --xid raw-xid --csrf-token raw-csrf --password pass123 token=kv-token"
+        '{"cookie": "secret-cookie", "xid": "secret-xid", "csrf": {"_cftoken": "csrf-secret"}, "api_key": "key", "base_url": "https://sip.local"}\n'
+        "cmd --cookie raw-cookie --xid raw-xid --csrf-token raw-csrf --password pass123 --base-url https://10.0.0.9 --host 172.16.1.117 token=kv-token "
+        "https://firewall.local/framework.php http://10.0.0.8:8080"
     )
 
     redacted = redact_secrets(payload)
@@ -49,7 +50,60 @@ def test_redaction_removes_headers_json_fields_and_cli_values():
     assert "raw-csrf" not in redacted
     assert "pass123" not in redacted
     assert "kv-token" not in redacted
-    assert redacted.count("[REDACTED]") >= 7
+    assert "bearer-secret" not in redacted
+    assert "sip.local" not in redacted
+    assert "10.0.0.9" not in redacted
+    assert "172.16.1.117" not in redacted
+    assert "firewall.local" not in redacted
+    assert "10.0.0.8" not in redacted
+    assert redacted.count("[REDACTED]") >= 10
+
+
+def test_pipeline_config_loads_target_base_urls(tmp_path):
+    config_path = tmp_path / "pipeline.yaml"
+    config_path.write_text(
+        "sip:\n"
+        "  base_url: https://sip.local\n"
+        "firewall:\n"
+        "  base_url: https://fw.local\n",
+        encoding="utf-8",
+    )
+
+    config = PipelineConfig.load(config_path, root_dir=tmp_path)
+
+    assert config.sip_base_url == "https://sip.local"
+    assert config.firewall_base_url == "https://fw.local"
+
+
+def test_login_commands_pass_configured_base_urls(tmp_path, monkeypatch):
+    config = PipelineConfig.from_dict(
+        {
+            "sip": {"base_url": "https://sip.local"},
+            "firewall": {"base_url": "https://fw.local"},
+        },
+        root_dir=tmp_path,
+    )
+    store = ArtifactStore(tmp_path / "runs", tmp_path / "state")
+    artifacts = store.create_run("20260707_130000")
+    manifest = RunManifest(artifacts.run_dir, "20260707_130000", {})
+    events = EventLogger(artifacts.run_dir, "20260707_130000")
+    commands = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run_subprocess(command, **kwargs):
+        commands.append(command)
+        return Result()
+
+    monkeypatch.setattr("pipeline.run_pipeline.run_subprocess", fake_run_subprocess)
+
+    PipelineRunner(config, artifacts, manifest, events).login(target="all", headless=True)
+
+    assert commands[0][commands[0].index("--base-url") + 1] == "https://sip.local"
+    assert commands[1][commands[1].index("--base-url") + 1] == "https://fw.local"
 
 
 def test_artifact_store_creates_run_layout_and_latest_state(tmp_path):
@@ -225,8 +279,8 @@ def test_check_sessions_rejects_need_login_health_result(tmp_path, monkeypatch):
 def test_manifest_and_events_redact_secret_values(tmp_path):
     run_dir = tmp_path / "runs" / "20260707_130000"
     (run_dir / "logs").mkdir(parents=True)
-    manifest = RunManifest(run_dir, "20260707_130000", {"session": SECRET_TEXT})
-    manifest.start_stage("check-sessions", {"message": SECRET_TEXT})
+    manifest = RunManifest(run_dir, "20260707_130000", {"session": SECRET_TEXT, "base_url": "https://sip.local"})
+    manifest.start_stage("check-sessions", {"message": SECRET_TEXT, "base_url": "https://firewall.local"})
     manifest.finish_stage("check-sessions", "failed", error=SECRET_TEXT)
     manifest.finish("failed", error=SECRET_TEXT)
 
@@ -239,6 +293,8 @@ def test_manifest_and_events_redact_secret_values(tmp_path):
     assert "SESSID=abc" not in combined
     assert "secret-xid" not in combined
     assert "csrf-secret" not in combined
+    assert "sip.local" not in combined
+    assert "firewall.local" not in combined
     assert "[REDACTED]" in combined
 
 

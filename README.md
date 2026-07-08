@@ -42,7 +42,7 @@ Required fields:
 
 ```json
 {
-  "base_url": "https://172.16.1.118",
+  "base_url": "https://sip.local",
   "cookie": "...",
   "xid": "..."
 }
@@ -58,7 +58,7 @@ Required fields:
 
 ```json
 {
-  "base_url": "https://172.16.1.116",
+  "base_url": "https://firewall.local",
   "product": "sangfor-firewall",
   "cookie": "...",
   "csrf": {

@@ -99,7 +99,7 @@ class AutoBlocklistTests(unittest.TestCase):
     def test_block_posts_expected_headers_and_payload(self):
         transport = FakeTransport()
         client = BlacklistClient(
-            base_url="https://172.16.1.116",
+            base_url="https://firewall.local",
             cookie="SESSID=abc; x-anti-csrf-gcs=csrf-cookie",
             csrf_token="csrf-header",
             transport=transport,
@@ -112,7 +112,7 @@ class AutoBlocklistTests(unittest.TestCase):
         self.assertEqual(call["method"], "POST")
         self.assertEqual(
             call["url"],
-            "https://172.16.1.116/api/batch/v1/namespaces/public/whiteblacklist?override=SKIPBACK",
+            "https://firewall.local/api/batch/v1/namespaces/public/whiteblacklist?override=SKIPBACK",
         )
         self.assertEqual(call["headers"]["Cookie"], "SESSID=abc; x-anti-csrf-gcs=csrf-cookie")
         self.assertEqual(call["headers"]["_cftoken"], "csrf-header")
@@ -127,7 +127,7 @@ class AutoBlocklistTests(unittest.TestCase):
             [(200, {"content-type": "application/json"}, b'{"data":{"file":"/export/blacklist_1783145132411.csv"}}')]
         )
         client = BlacklistClient(
-            base_url="https://172.16.1.116",
+            base_url="https://firewall.local",
             cookie="SESSID=abc",
             csrf_token="csrf-header",
             transport=transport,
@@ -138,7 +138,7 @@ class AutoBlocklistTests(unittest.TestCase):
         self.assertEqual(export_file, "/export/blacklist_1783145132411.csv")
         call = transport.calls[0]
         self.assertEqual(call["method"], "POST")
-        self.assertEqual(call["url"], "https://172.16.1.116/api/v1/namespaces/public/export")
+        self.assertEqual(call["url"], "https://firewall.local/api/v1/namespaces/public/export")
         self.assertEqual(call["headers"]["_cftoken"], "csrf-header")
         self.assertEqual(call["headers"]["Content-Type"], "application/json")
         self.assertEqual(
@@ -156,7 +156,7 @@ class AutoBlocklistTests(unittest.TestCase):
                 file.write(b"keep\n")
             transport = FakeTransport([(200, {"content-type": "text/csv"}, b"url,description\n")])
             client = BlacklistClient(
-                base_url="https://172.16.1.116",
+                base_url="https://firewall.local",
                 cookie="SESSID=abc",
                 csrf_token="csrf-header",
                 transport=transport,
@@ -168,7 +168,7 @@ class AutoBlocklistTests(unittest.TestCase):
             self.assertEqual(call["method"], "POST")
             self.assertEqual(
                 call["url"],
-                "https://172.16.1.116/php/loadfile.php?file=/export/blacklist_1783145132411.csv",
+                "https://firewall.local/php/loadfile.php?file=/export/blacklist_1783145132411.csv",
             )
             self.assertEqual(call["data"], b"")
             self.assertEqual(call["headers"]["Content-Type"], "application/x-www-form-urlencoded")

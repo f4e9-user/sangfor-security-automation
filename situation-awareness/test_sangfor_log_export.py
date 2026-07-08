@@ -21,9 +21,9 @@ from sangfor_log_export import (
 def test_parse_cookie_header_splits_cookie_pairs():
     cookies = parse_cookie_header("a=1; sess_id=abc; flag=x=y")
     assert cookies == [
-        {"name": "a", "value": "1", "domain": "172.16.1.118", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
-        {"name": "sess_id", "value": "abc", "domain": "172.16.1.118", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
-        {"name": "flag", "value": "x=y", "domain": "172.16.1.118", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
+        {"name": "a", "value": "1", "domain": "sip.local", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
+        {"name": "sess_id", "value": "abc", "domain": "sip.local", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
+        {"name": "flag", "value": "x=y", "domain": "sip.local", "path": "/", "secure": True, "httpOnly": False, "sameSite": "Lax"},
     ]
 
 
@@ -102,7 +102,7 @@ def test_load_session_file_reads_cookie_xid_and_base_url(tmp_path):
     session_path.write_text(
         json.dumps(
             {
-                "base_url": "https://172.16.1.118",
+                "base_url": "https://sip.local",
                 "cookie": "sess_id=abc; token=def",
                 "xid": "x-123",
                 "created_at": "2026-07-04 10:00:00",
@@ -114,7 +114,7 @@ def test_load_session_file_reads_cookie_xid_and_base_url(tmp_path):
     session = load_session_file(session_path)
 
     assert session == {
-        "base_url": "https://172.16.1.118",
+        "base_url": "https://sip.local",
         "cookie": "sess_id=abc; token=def",
         "xid": "x-123",
         "created_at": "2026-07-04 10:00:00",

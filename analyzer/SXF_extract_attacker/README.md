@@ -287,14 +287,14 @@ Cookie 默认优先从 `/home/user/.config/sangfor-firewall/session.json` 读取
 基础用法：
 
 ```bash
-python3 tools/sangfor_sip_cookie_keepalive.py --host 172.16.1.118 --insecure
+python3 tools/sangfor_sip_cookie_keepalive.py --host sip.local --insecure
 ```
 
 指定保活查询语句和请求间隔：
 
 ```bash
 python3 tools/sangfor_sip_cookie_keepalive.py \
-  --host 172.16.1.118 \
+  --host sip.local \
   --query "src_ip:117.72.195.41" \
   --interval 60 \
   --insecure

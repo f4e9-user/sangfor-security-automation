@@ -37,7 +37,7 @@ python /home/user/projects/sangfor-security-automation/situation-awareness/sangf
 
 ```json
 {
-  "base_url": "https://172.16.1.118",
+  "base_url": "https://sip.local",
   "cookie": "...",
   "xid": "...",
   "created_at": "..."
@@ -60,7 +60,7 @@ python /home/user/projects/sangfor-security-automation/firewall/sangfor_firewall
 
 ```json
 {
-  "base_url": "https://172.16.1.116",
+  "base_url": "https://firewall.local",
   "product": "sangfor-firewall",
   "cookie": "...",
   "csrf": {
@@ -830,14 +830,14 @@ paths:
   state_dir: /app/state
 
 sip:
-  base_url: https://172.16.1.118
+  base_url: https://sip.local
   default_favorite_name: "3"
   export_limit: 10000
   keepalive_interval_seconds: 300
   verify_tls: false
 
 firewall:
-  base_url: https://172.16.1.116
+  base_url: https://firewall.local
   framework_path: /framework.php
   keepalive_interval_seconds: 300
   verify_tls: false

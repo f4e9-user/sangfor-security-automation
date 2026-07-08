@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 SESSION_PATH = Path('/home/user/.config/sangfor-firewall/session.json')
-URL = 'https://172.16.1.116/framework.php'
+URL = 'https://firewall.local/framework.php'
 SCREENSHOT = Path('/tmp/sangfor-firewall-keepalive-check.png')
 
 
@@ -43,7 +43,7 @@ def main() -> None:
         print(f'[{now}] Sangfor firewall cookie check: FAIL session file has no cookie')
         return
 
-    host = urlparse(URL).hostname or '172.16.1.116'
+    host = urlparse(URL).hostname or 'firewall.local'
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--ignore-certificate-errors'])
         try:

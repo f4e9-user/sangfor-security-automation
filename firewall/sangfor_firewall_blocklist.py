@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 
-DEFAULT_BASE_URL = "https://172.16.1.116"
+DEFAULT_BASE_URL = "https://firewall.local"
 SESSION_FILE = Path("/home/user/.config/sangfor-firewall/session.json")
 DEFAULT_CSRF_TOKEN = None
 OUTPUT_DIR = Path("outputs")

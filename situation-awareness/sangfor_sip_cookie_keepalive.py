@@ -127,7 +127,7 @@ def main() -> int:
         description="Keep a Sangfor SIP Cookie alive by sending a log query request every N seconds (default 300)."
     )
     parser.add_argument("--session-file", help="Read base_url, cookie, and xid from a Sangfor SIP session JSON file")
-    parser.add_argument("--host", default="172.16.1.118", help="API host used with explicit --cookie and --xid")
+    parser.add_argument("--host", default="sip.local", help="API host used with explicit --cookie and --xid")
     parser.add_argument(
         "--path",
         default="/apps/secvisual/log_query2/ksearch_log/check_query_string",
