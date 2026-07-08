@@ -31,8 +31,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Populate analyzer source
+        shell: bash
+        run: |
+          rm -rf analyzer/SXF_extract_attacker
+          git clone --depth 1 https://github.com/atsud0/SXF_extract_attacker.git analyzer/SXF_extract_attacker
+          git -C analyzer/SXF_extract_attacker fetch --depth 1 origin c5ae8879ac34c3b13e8a0c49d1ef5f7d3c95b0fc
+          git -C analyzer/SXF_extract_attacker checkout c5ae8879ac34c3b13e8a0c49d1ef5f7d3c95b0fc
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
