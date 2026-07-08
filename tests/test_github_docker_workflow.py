@@ -6,7 +6,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "docker-images.yml"
 COMPOSE = ROOT / "docker-compose.yml"
 DOCKERIGNORE = ROOT / ".dockerignore"
-GITMODULES = ROOT / ".gitmodules"
 
 
 def test_docker_images_workflow_publishes_runtime_and_playwright_images():
@@ -25,7 +24,10 @@ def test_docker_images_workflow_publishes_runtime_and_playwright_images():
     assert permissions["packages"] == "write"
     checkout = workflow_jobs["build-and-push"]["steps"][0]
     assert checkout["uses"] == "actions/checkout@v4"
-    assert checkout["with"]["submodules"] == "recursive"
+    populate = workflow_jobs["build-and-push"]["steps"][1]
+    assert populate["name"] == "Populate analyzer source"
+    assert "https://github.com/atsud0/SXF_extract_attacker.git" in populate["run"]
+    assert "c5ae8879ac34c3b13e8a0c49d1ef5f7d3c95b0fc" in populate["run"]
 
 
 def test_compose_uses_prebuilt_ghcr_images_for_all_services():
@@ -43,9 +45,3 @@ def test_dockerignore_excludes_sensitive_and_runtime_artifacts():
     assert "runs/" in entries
     assert "state/" in entries
     assert ".venv/" in entries
-
-
-def test_analyzer_gitlink_has_submodule_mapping_for_actions_checkout():
-    text = GITMODULES.read_text(encoding="utf-8")
-    assert "analyzer/SXF_extract_attacker" in text
-    assert "https://github.com/atsud0/SXF_extract_attacker.git" in text
