@@ -66,6 +66,8 @@ class SchedulerConfig:
 class PipelineConfig:
     root_dir: Path
     paths: PathConfig
+    sip_base_url: str
+    firewall_base_url: str
     analysis: AnalysisConfig
     blocking: BlockingConfig
     schedules: dict[str, ScheduleConfig]
@@ -84,6 +86,8 @@ class PipelineConfig:
     def from_dict(cls, data: dict[str, Any], *, root_dir: str | Path) -> "PipelineConfig":
         root = Path(root_dir).resolve()
         paths_data = data.get("paths", {}) or {}
+        sip_data = data.get("sip", {}) or {}
+        firewall_data = data.get("firewall", {}) or {}
         analysis_data = data.get("analysis", {}) or {}
         blocking_data = data.get("blocking", {}) or {}
         schedules_data = data.get("schedules", {}) or {}
@@ -117,6 +121,8 @@ class PipelineConfig:
         return cls(
             root_dir=root,
             paths=paths,
+            sip_base_url=str(sip_data.get("base_url", "https://sip.local")).rstrip("/"),
+            firewall_base_url=str(firewall_data.get("base_url", "https://firewall.local")).rstrip("/"),
             analysis=analysis,
             blocking=blocking,
             schedules=_parse_schedules(schedules_data),
