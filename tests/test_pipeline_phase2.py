@@ -283,6 +283,8 @@ def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypat
         "chaojiying",
         "--chaojiying-codetype",
         "1902",
+        "--browser-executable",
+        "/tmp/chrome",
     ])
 
     assert exit_code == 0
@@ -295,9 +297,11 @@ def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypat
         credentials_index = call.index("--credentials-file")
         provider_index = call.index("--captcha-provider")
         codetype_index = call.index("--chaojiying-codetype")
+        browser_index = call.index("--browser-executable")
         assert call[credentials_index + 1] == str(credentials_file)
         assert call[provider_index + 1] == "chaojiying"
         assert call[codetype_index + 1] == "1902"
+        assert call[browser_index + 1] == "/tmp/chrome"
     assert "--no-keepalive" in calls[1]
 
 

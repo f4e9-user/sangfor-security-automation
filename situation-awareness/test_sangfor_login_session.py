@@ -20,7 +20,10 @@ def test_parser_accepts_encrypted_credentials_and_chaojiying_options():
         "chaojiying",
         "--chaojiying-codetype",
         "1902",
+        "--browser-executable",
+        "/tmp/chrome",
     ])
     assert args.credentials_file == "secrets/login.json.gpg"
     assert args.captcha_provider == "chaojiying"
     assert args.chaojiying_codetype == "1902"
+    assert args.browser_executable == "/tmp/chrome"

@@ -24,6 +24,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline.login_credentials import load_login_credentials, recognize_captcha_with_chaojiying
+from pipeline.playwright_browser import chromium_launch_options
 
 DEFAULT_BASE_URL = "https://172.16.1.116"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -203,7 +204,7 @@ def login(args: argparse.Namespace) -> dict:
     captcha_path = Path(args.captcha_file).expanduser()
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=args.headless, args=["--ignore-certificate-errors"])
+        browser = playwright.chromium.launch(**chromium_launch_options(headless=args.headless, executable_path=args.browser_executable))
         try:
             page = browser.new_page(ignore_https_errors=True, viewport={"width": 1440, "height": 950})
             page.goto(args.base_url.rstrip("/"), wait_until="networkidle", timeout=60000)
@@ -266,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--credentials-file", help="GPG-encrypted JSON containing sip/firewall/chaojiying credentials")
     parser.add_argument("--captcha-provider", choices=("manual", "chaojiying"), default="manual")
     parser.add_argument("--chaojiying-codetype", help="Override Chaojiying codetype, e.g. 1004")
+    parser.add_argument("--browser-executable", help="Use an existing Chromium/Chrome executable instead of Playwright's bundled headless shell")
     parser.add_argument("--keepalive", action=argparse.BooleanOptionalAction, default=True, help="Keep Playwright open and refresh periodically after login")
     parser.add_argument("--keepalive-interval", type=int, default=300, help="Seconds between keepalive refreshes")
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
