@@ -12,6 +12,7 @@ exports/
 outputs/
 logs/
 data/
+.playwright-browsers/
 
 # Local editor and OS noise
 .DS_Store

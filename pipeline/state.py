@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from .redaction import redact_data, redact_secrets
 
@@ -78,11 +78,15 @@ class RunManifest:
 
 
 class EventLogger:
-    def __init__(self, run_dir: str | Path, run_id: str):
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+
+    def __init__(self, run_dir: str | Path, run_id: str, *, console: TextIO | None = None, console_level: str = "INFO"):
         self.run_dir = Path(run_dir)
         self.run_id = run_id
         self.path = self.run_dir / "logs" / "events.jsonl"
         self.pipeline_log_path = self.run_dir / "logs" / "pipeline.log"
+        self.console = console
+        self.console_level = self.LEVELS.get(console_level.upper(), self.LEVELS["INFO"])
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, stage: str, level: str, event: str, message: str, data: dict[str, Any] | None = None) -> None:
@@ -102,3 +106,8 @@ class EventLogger:
             line += " " + json.dumps(row["data"], ensure_ascii=False)
         with self.pipeline_log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+        if self.console and self.LEVELS.get(level.upper(), self.LEVELS["INFO"]) >= self.console_level:
+            console_line = f"[{level}] {stage} {event}: {row['message']}"
+            if row["data"]:
+                console_line += " " + json.dumps(row["data"], ensure_ascii=False)
+            print(console_line, file=self.console, flush=True)

@@ -97,7 +97,7 @@ def export_firewall_blacklist_command(root: Path, session_file: Path, output_dir
     ]
 
 
-def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whitelist_file: Path, output_dir: Path) -> tuple[list[str], Path]:
+def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whitelist_file: Path, output_dir: Path, *, persist_history: bool = False) -> tuple[list[str], Path]:
     analyzer_dir = root / "analyzer" / "SXF_extract_attacker"
     command = [
         sys.executable,
@@ -108,9 +108,13 @@ def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whit
         "--exclude-from-csv",
         "--local-analyze",
         "--blocklist",
+    ]
+    if not persist_history:
+        command.append("--no-db")
+    command.extend([
         "--db-path",
         str(db_path),
-    ]
+    ])
     return command, analyzer_dir
 
 
@@ -250,6 +254,11 @@ def copy_analyzer_output(root: Path, analysis_dir: Path, source_report: Path) ->
 
 def _normalize_row(row: dict[str, str], source_report: str) -> dict[str, str]:
     final_score = _first(row, "final_score", "评分", "最终评分")
+    evidence_summary = _join_nonempty(
+        _first(row, "evidence_summary", "证据摘要", "evidence", default=""),
+        _first(row, "样本描述", "sample_description", default=""),
+        _first(row, "Payload风险", "payload_risk", default=""),
+    )
     return {
         "ip": _first(row, "ip", "IP", "源IP", "src_ip"),
         "recommendation": _first(row, "recommendation", "建议", "推荐动作"),
@@ -257,10 +266,10 @@ def _normalize_row(row: dict[str, str], source_report: str) -> dict[str, str]:
         "base_score": _first(row, "base_score", "基础评分", "行为分", default=final_score),
         "history_score": _first(row, "history_score", "历史评分", default=""),
         "attack_count": _first(row, "attack_count", "攻击次数", "count", default=""),
-        "threat_types": _first(row, "threat_types", "威胁类型", "主要威胁类型", default=""),
+        "threat_types": _first(row, "threat_types", "主要威胁", "威胁类型", "主要威胁类型", default=""),
         "severity": _first(row, "severity", "最高严重等级", "严重等级", default=""),
         "attack_chain": _first(row, "attack_chain", "攻击链", "攻击链阶段", default=""),
-        "evidence_summary": _truncate(_first(row, "evidence_summary", "证据摘要", "evidence", default="")),
+        "evidence_summary": _truncate(evidence_summary),
         "sample_urls": _truncate(_first(row, "sample_urls", "样本URL", "样本 URL", "url", default="")),
         "historical_occurrences": _first(row, "historical_occurrences", "历史出现次数", default=""),
         "recommendation_reasons": _first(row, "recommendation_reasons", "推荐理由", "原因", default=""),
@@ -269,6 +278,10 @@ def _normalize_row(row: dict[str, str], source_report: str) -> dict[str, str]:
         "blocked_this_run": str(_first(row, "blocked_this_run", default="false")).lower(),
         "skip_reason": _first(row, "skip_reason", default=""),
     }
+
+
+def _join_nonempty(*values: str) -> str:
+    return " | ".join(value.strip() for value in values if value and value.strip())
 
 
 def _first(row: dict[str, str], *keys: str, default: str = "") -> str:

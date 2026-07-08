@@ -15,6 +15,7 @@ from pipeline.state import EventLogger, RunManifest
 from pipeline.commands import (
     NORMALIZED_RECOMMENDATION_FIELDS,
     ApplyGuardError,
+    analyze_command,
     normalize_recommendations,
     select_block_targets,
     write_apply_result,
@@ -68,8 +69,8 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
     source_report = tmp_path / "sangfor-sip-report-KsearchLog-2026070701.xlsx"
     raw_csv = tmp_path / "raw.csv"
     raw_csv.write_text(
-        "IP,建议,评分,final_score,base_score,history_score,攻击次数,威胁类型,最高严重等级,攻击链,证据摘要,样本URL,历史出现次数,推荐理由,already_blacklisted\n"
-        "1.1.1.1,立即封禁,88,91,70,21,42,SQL注入|扫描,高,侦察>利用,证据,https://example.test/a,3,高频攻击|历史复现,false\n",
+        "IP,建议,评分,final_score,base_score,history_score,攻击次数,威胁类型,主要威胁,最高严重等级,攻击链,Payload风险,证据摘要,样本描述,样本URL,历史出现次数,推荐理由,already_blacklisted\n"
+        "1.1.1.1,立即封禁,88,91,70,21,42,SQL注入|扫描,信息泄露|网站扫描,高,侦察>利用,源码/备份文件探测,证据,检测到网站攻击！攻击类型：信息泄漏攻击,https://example.test/a,3,高频攻击|历史复现,false\n",
         encoding="utf-8",
     )
     normalized = tmp_path / "blocklist_recommendations.normalized.csv"
@@ -82,8 +83,39 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
     assert rows[0]["recommendation"] == "立即封禁"
     assert rows[0]["final_score"] == "91"
     assert rows[0]["source_report"] == str(source_report)
+    assert rows[0]["threat_types"] == "信息泄露|网站扫描"
+    assert "检测到网站攻击" in rows[0]["evidence_summary"]
+    assert "源码/备份文件探测" in rows[0]["evidence_summary"]
+    assert rows[0]["sample_urls"] == "https://example.test/a"
     assert rows[0]["blocked_this_run"] == "false"
     assert rows[0]["skip_reason"] == ""
+
+
+def test_analyze_command_can_disable_or_enable_history_persistence(tmp_path):
+    command, cwd = analyze_command(
+        tmp_path,
+        tmp_path / "logs.xlsx",
+        tmp_path / "blacklist.csv",
+        tmp_path / "attackers.db",
+        tmp_path / "ip_whitelist.txt",
+        tmp_path / "analysis",
+        persist_history=False,
+    )
+
+    assert cwd == tmp_path / "analyzer" / "SXF_extract_attacker"
+    assert "--blocklist" in command
+    assert "--no-db" in command
+
+    apply_command, _ = analyze_command(
+        tmp_path,
+        tmp_path / "logs.xlsx",
+        tmp_path / "blacklist.csv",
+        tmp_path / "attackers.db",
+        tmp_path / "ip_whitelist.txt",
+        tmp_path / "analysis",
+        persist_history=True,
+    )
+    assert "--no-db" not in apply_command
 
 
 def test_select_block_targets_defaults_to_dry_run_and_skips_monitoring_whitelist_and_blacklist(tmp_path):
@@ -305,6 +337,61 @@ def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypat
     assert "--no-keepalive" in calls[1]
 
 
+def test_run_command_prints_console_progress_summary_and_log_paths(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipeline.yaml"
+    config_path.write_text(
+        "paths:\n"
+        f"  runs_dir: {tmp_path / 'runs'}\n"
+        f"  state_dir: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+
+    def fake_check_sessions(self):
+        self.manifest.start_stage("check-sessions")
+        self.events.emit("check-sessions", "INFO", "stage_started", "checking session files")
+        self.events.emit("check-sessions", "DEBUG", "health_payload", "debug health payload", {"sip": "ok"})
+        self.manifest.finish_stage("check-sessions", "completed")
+        self.events.emit("check-sessions", "INFO", "stage_completed", "session health checks passed")
+
+    monkeypatch.setattr(PipelineRunner, "check_sessions", fake_check_sessions)
+
+    exit_code = run_command(["--config", str(config_path), "--run-id", "20260707_083000", "check-sessions"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Run ID: 20260707_083000" in out
+    assert f"Run dir: {tmp_path / 'runs' / '20260707_083000'}" in out
+    assert "[INFO] check-sessions stage_started: checking session files" in out
+    assert "debug health payload" not in out
+    assert "Status: completed" in out
+    assert "Events: " in out
+    assert "events.jsonl" in out
+    assert "Pipeline log: " in out
+    assert "pipeline.log" in out
+
+
+def test_run_command_debug_prints_debug_events(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipeline.yaml"
+    config_path.write_text(
+        "paths:\n"
+        f"  runs_dir: {tmp_path / 'runs'}\n"
+        f"  state_dir: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+
+    def fake_check_sessions(self):
+        self.events.emit("check-sessions", "DEBUG", "health_payload", "debug health payload", {"sip": "ok"})
+
+    monkeypatch.setattr(PipelineRunner, "check_sessions", fake_check_sessions)
+
+    exit_code = run_command(["--config", str(config_path), "--run-id", "20260707_083000", "--debug", "check-sessions"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "[DEBUG] check-sessions health_payload: debug health payload" in out
+    assert '{"sip": "ok"}' in out
+
+
 def test_schedule_window_calculates_previous_day_in_configured_timezone(tmp_path):
     config = PipelineConfig.from_dict(
         {
@@ -388,7 +475,7 @@ def test_full_apply_runs_dry_run_before_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "check_sessions", lambda: calls.append(("check_sessions", None)))
     monkeypatch.setattr(runner, "export_logs", lambda start, end, favorite_name, export_date: calls.append(("export_logs", None)) or tmp_path / "logs.xlsx")
     monkeypatch.setattr(runner, "export_firewall_blacklist", lambda: calls.append(("export_firewall_blacklist", None)) or tmp_path / "blacklist.csv")
-    monkeypatch.setattr(runner, "analyze", lambda xlsx, blacklist: calls.append(("analyze", None)) or recommendations)
+    monkeypatch.setattr(runner, "analyze", lambda xlsx, blacklist, *, persist_history=False: calls.append(("analyze", persist_history)) or recommendations)
     monkeypatch.setattr(runner, "block", lambda recs, *, apply=False, manual_override_reason=None: calls.append(("block", apply)) or ["1.1.1.1"])
     monkeypatch.setattr("pipeline.run_pipeline.write_daily_report", lambda *args, **kwargs: (tmp_path / "report.md", tmp_path / "report.json"))
 
@@ -398,10 +485,29 @@ def test_full_apply_runs_dry_run_before_apply(tmp_path, monkeypatch):
         ("check_sessions", None),
         ("export_logs", None),
         ("export_firewall_blacklist", None),
-        ("analyze", None),
+        ("analyze", True),
         ("block", False),
         ("block", True),
     ]
+
+
+def test_full_dry_run_does_not_persist_analysis_history(tmp_path, monkeypatch):
+    config = PipelineConfig.from_dict({}, root_dir=tmp_path)
+    artifacts = ArtifactStore(tmp_path / "runs", tmp_path / "state").create_run("20260707_083000")
+    runner = PipelineRunner(config, artifacts, RunManifest(artifacts.run_dir, artifacts.run_id, {}), EventLogger(artifacts.run_dir, artifacts.run_id))
+    recommendations = artifacts.analysis_dir / "blocklist_recommendations.normalized.csv"
+    calls = []
+
+    monkeypatch.setattr(runner, "check_sessions", lambda: None)
+    monkeypatch.setattr(runner, "export_logs", lambda start, end, favorite_name, export_date: tmp_path / "logs.xlsx")
+    monkeypatch.setattr(runner, "export_firewall_blacklist", lambda: tmp_path / "blacklist.csv")
+    monkeypatch.setattr(runner, "analyze", lambda xlsx, blacklist, *, persist_history=False: calls.append(("analyze", persist_history)) or recommendations)
+    monkeypatch.setattr(runner, "block", lambda recs, *, apply=False, manual_override_reason=None: calls.append(("block", apply)) or ["1.1.1.1"])
+    monkeypatch.setattr("pipeline.run_pipeline.write_daily_report", lambda *args, **kwargs: (tmp_path / "report.md", tmp_path / "report.json"))
+
+    runner.full("2026-07-06 00:00:00", "2026-07-06 23:59:59", None, None, apply=False)
+
+    assert calls == [("analyze", False), ("block", False)]
 
 
 def test_apply_refuses_when_targets_are_empty_and_writes_apply_result(tmp_path):
