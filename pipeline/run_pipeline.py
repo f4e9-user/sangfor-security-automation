@@ -51,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--credentials-file", help="GPG-encrypted JSON containing sip/firewall/chaojiying credentials")
     login.add_argument("--captcha-provider", choices=("manual", "chaojiying"), default="manual")
     login.add_argument("--chaojiying-codetype", help="Override Chaojiying codetype, e.g. 1004")
+    login.add_argument("--browser-executable", help="Use an existing Chromium/Chrome executable for login helpers")
     login.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     login.add_argument("--firewall-keepalive", action=argparse.BooleanOptionalAction, default=False)
 
@@ -104,6 +105,7 @@ def run_command(argv: list[str] | None = None) -> int:
                 credentials_file=args.credentials_file,
                 captcha_provider=args.captcha_provider,
                 chaojiying_codetype=args.chaojiying_codetype,
+                browser_executable=args.browser_executable,
                 headless=args.headless,
                 firewall_keepalive=args.firewall_keepalive,
             )
@@ -146,6 +148,7 @@ class PipelineRunner:
         credentials_file: str | None = None,
         captcha_provider: str = "manual",
         chaojiying_codetype: str | None = None,
+        browser_executable: str | None = None,
         headless: bool = True,
         firewall_keepalive: bool = False,
     ) -> None:
@@ -168,6 +171,8 @@ class PipelineRunner:
                 command.extend(["--captcha-provider", captcha_provider])
                 if chaojiying_codetype:
                     command.extend(["--chaojiying-codetype", chaojiying_codetype])
+                if browser_executable:
+                    command.extend(["--browser-executable", browser_executable])
                 command.append("--headless" if headless else "--no-headless")
                 stdout_path = self.artifacts.logs_dir / "login-sip.stdout.log"
                 stderr_path = self.artifacts.logs_dir / "login-sip.stderr.log"
@@ -185,6 +190,8 @@ class PipelineRunner:
                 command.extend(["--captcha-provider", captcha_provider])
                 if chaojiying_codetype:
                     command.extend(["--chaojiying-codetype", chaojiying_codetype])
+                if browser_executable:
+                    command.extend(["--browser-executable", browser_executable])
                 command.append("--headless" if headless else "--no-headless")
                 command.append("--keepalive" if firewall_keepalive else "--no-keepalive")
                 stdout_path = self.artifacts.logs_dir / "login-firewall.stdout.log"
