@@ -1,0 +1,15 @@
+services:
+  extract-attacker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: extract-attacker:local
+    working_dir: /app
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./work:/work
+    environment:
+      ALIBABA_CLOUD_API_KEY: ${ALIBABA_CLOUD_API_KEY:-}
+    command: ["--help"]

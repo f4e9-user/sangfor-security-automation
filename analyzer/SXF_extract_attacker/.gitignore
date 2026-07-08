@@ -1,0 +1,35 @@
+# Python 缓存和字节码
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 机器学习模型文件（通常较大且二进制，不适合版本控制）
+*.pkl
+*.joblib
+*.h5
+*.onnx
+
+# 数据库文件（除非你明确需要共享初始数据）
+*.db
+*.sqlite
+
+# 备份/旧版本代码（你已有 old_version 目录，但可能还有临时备份）
+*_bak.py
+*~ 
+*.bak
+
+# IDE / 编辑器临时文件（可选，按需添加）
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# IP地址
+ip_whitelist.txt
+blacklist.csv
+
+# 运行输出和报表产物
+outputs/
+*_processed.csv
+blocklist_recommendations.csv
