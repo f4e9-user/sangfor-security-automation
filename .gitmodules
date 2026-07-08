@@ -1,0 +1,3 @@
+[submodule "analyzer/SXF_extract_attacker"]
+	path = analyzer/SXF_extract_attacker
+	url = https://github.com/atsud0/SXF_extract_attacker.git
