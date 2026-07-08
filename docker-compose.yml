@@ -1,0 +1,79 @@
+services:
+  sip-keepalive:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.playwright
+    command:
+      - python
+      - situation-awareness/sangfor_sip_cookie_keepalive.py
+      - --session-file
+      - /app/secrets/sip_session.json
+      - --interval
+      - "300"
+      - --stop-on-need-login
+      - --insecure
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./exports:/app/exports
+      - ./runs:/app/runs
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped
+
+  firewall-keepalive:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.playwright
+    command:
+      - python
+      - firewall/firewall_keepalive.py
+      - --session-file
+      - /app/secrets/firewall_session.json
+      - --status-file
+      - /app/state/firewall_session.status.json
+      - --interval
+      - "300"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./exports:/app/exports
+      - ./runs:/app/runs
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "pipeline/run_pipeline.py", "--help"]
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./exports:/app/exports
+      - ./runs:/app/runs
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets:ro
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "pipeline/scheduler.py", "--config", "/app/config/pipeline.yaml"]
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./exports:/app/exports
+      - ./runs:/app/runs
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped

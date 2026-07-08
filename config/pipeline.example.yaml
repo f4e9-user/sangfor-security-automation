@@ -1,0 +1,64 @@
+paths:
+  sip_session_file: /app/secrets/sip_session.json
+  firewall_session_file: /app/secrets/firewall_session.json
+  data_dir: /app/data
+  outputs_dir: /app/outputs
+  runs_dir: /app/runs
+  state_dir: /app/state
+
+sip:
+  base_url: https://172.16.1.118
+  default_favorite_name: "3"
+  export_limit: 10000
+  keepalive_interval_seconds: 300
+  verify_tls: false
+
+firewall:
+  base_url: https://172.16.1.116
+  framework_path: /framework.php
+  keepalive_interval_seconds: 300
+  verify_tls: false
+
+analysis:
+  db_path: /app/data/attackers.db
+  whitelist_file: /app/config/ip_whitelist.txt
+  recommendation_levels:
+    - 立即封禁
+    - 建议封禁
+  min_final_score: 45
+
+blocking:
+  default_apply: false
+  description_template: "{month}月自动封禁"
+  max_targets_per_run: 200
+
+logging:
+  retention_days: 90
+  redact_secrets: true
+  write_jsonl_events: true
+
+schedules:
+  daily-default:
+    enabled: true
+    cron: "30 8 * * *"
+    timezone: Asia/Shanghai
+    allow_apply: false
+    favorite_name: "3"
+    window:
+      type: previous_day
+      timezone: Asia/Shanghai
+      start_time: "00:00:00"
+      end_time: "23:59:59"
+    report:
+      enabled: true
+      output_formats: [markdown, json]
+
+scheduler:
+  enabled: true
+  poll_interval_seconds: 30
+
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8080
+  readonly: true
