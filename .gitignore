@@ -1,0 +1,19 @@
+# Runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Sangfor runtime state and sensitive local inputs
+secrets/
+state/
+runs/
+exports/
+outputs/
+logs/
+data/
+
+# Local editor and OS noise
+.DS_Store
+.vscode/
+.idea/
