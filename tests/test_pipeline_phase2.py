@@ -75,6 +75,32 @@ def test_pipeline_config_loads_target_base_urls(tmp_path):
     assert config.firewall_base_url == "https://fw.local"
 
 
+def test_pipeline_config_prefers_ignored_local_config_by_default(tmp_path):
+    config_dir = tmp_path / "config"
+    secrets_dir = tmp_path / "secrets"
+    config_dir.mkdir()
+    secrets_dir.mkdir()
+    (config_dir / "pipeline.yaml").write_text(
+        "sip:\n"
+        "  base_url: https://sip.local\n"
+        "firewall:\n"
+        "  base_url: https://firewall.local\n",
+        encoding="utf-8",
+    )
+    (secrets_dir / "pipeline.local.yaml").write_text(
+        "sip:\n"
+        "  base_url: https://private-sip.local\n"
+        "firewall:\n"
+        "  base_url: https://private-fw.local\n",
+        encoding="utf-8",
+    )
+
+    config = PipelineConfig.load(root_dir=tmp_path)
+
+    assert config.sip_base_url == "https://private-sip.local"
+    assert config.firewall_base_url == "https://private-fw.local"
+
+
 def test_login_commands_pass_configured_base_urls(tmp_path, monkeypatch):
     config = PipelineConfig.from_dict(
         {

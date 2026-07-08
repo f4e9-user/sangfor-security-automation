@@ -12,7 +12,8 @@ situation-awareness/              # SIP login/session, keepalive, and log export
 firewall/                         # Sangfor AF session, blacklist export, and blocking helpers
 analyzer/SXF_extract_attacker/     # upstream analysis engine used by the pipeline
 docs/                             # design and operational documentation
-config/pipeline.yaml              # pipeline defaults
+config/pipeline.yaml              # tracked placeholder defaults
+secrets/pipeline.local.yaml       # optional ignored local runtime config
 ```
 
 ## Environment Setup
@@ -70,15 +71,17 @@ Required fields:
 
 ## Unified Pipeline
 
+By default the CLI loads `secrets/pipeline.local.yaml` when it exists, then falls back to `config/pipeline.yaml`. Keep real internal base URLs in the ignored local config, not in tracked files.
+
 Run stages through the pipeline module:
 
 ```bash
-python -m pipeline.run_pipeline --config config/pipeline.yaml check-sessions
-python -m pipeline.run_pipeline --config config/pipeline.yaml export-logs --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
-python -m pipeline.run_pipeline --config config/pipeline.yaml export-firewall-blacklist
-python -m pipeline.run_pipeline --config config/pipeline.yaml analyze
-python -m pipeline.run_pipeline --config config/pipeline.yaml block
-python -m pipeline.run_pipeline --config config/pipeline.yaml full --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
+python -m pipeline.run_pipeline check-sessions
+python -m pipeline.run_pipeline export-logs --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
+python -m pipeline.run_pipeline export-firewall-blacklist
+python -m pipeline.run_pipeline analyze
+python -m pipeline.run_pipeline block
+python -m pipeline.run_pipeline full --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
 ```
 
 `block` is dry-run by default. Real firewall changes require `--apply`; `full --apply` first writes dry-run artifacts and then runs the apply stage with same-run prerequisite checks.

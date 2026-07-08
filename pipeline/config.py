@@ -76,7 +76,11 @@ class PipelineConfig:
     @classmethod
     def load(cls, config_path: str | Path | None = None, *, root_dir: str | Path | None = None) -> "PipelineConfig":
         root = Path(root_dir).resolve() if root_dir else Path(__file__).resolve().parents[1]
-        path = Path(config_path).expanduser() if config_path else root / "config" / "pipeline.yaml"
+        if config_path:
+            path = Path(config_path).expanduser()
+        else:
+            local_path = root / "secrets" / "pipeline.local.yaml"
+            path = local_path if local_path.exists() else root / "config" / "pipeline.yaml"
         data: dict[str, Any] = {}
         if path.exists():
             data = _load_yaml(path)
