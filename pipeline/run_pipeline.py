@@ -44,6 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", help="reuse or create a specific run id")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    login = subparsers.add_parser("login")
+    login.add_argument("--target", choices=("all", "sip", "firewall"), default="all")
+    login.add_argument("--sip-username")
+    login.add_argument("--firewall-username")
+    login.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    login.add_argument("--firewall-keepalive", action=argparse.BooleanOptionalAction, default=False)
+
     subparsers.add_parser("check-sessions")
 
     export_logs = subparsers.add_parser("export-logs")
@@ -86,7 +93,9 @@ def run_command(argv: list[str] | None = None) -> int:
     runner = PipelineRunner(config, artifacts, manifest, events)
 
     try:
-        if args.command == "check-sessions":
+        if args.command == "login":
+            runner.login(args.target, sip_username=args.sip_username, firewall_username=args.firewall_username, headless=args.headless, firewall_keepalive=args.firewall_keepalive)
+        elif args.command == "check-sessions":
             runner.check_sessions()
         elif args.command == "export-logs":
             runner.export_logs(args.start, args.end, args.favorite_name, args.export_date)
@@ -115,6 +124,44 @@ class PipelineRunner:
         self.artifacts = artifacts
         self.manifest = manifest
         self.events = events
+
+    def login(self, target: str = "all", *, sip_username: str | None = None, firewall_username: str | None = None, headless: bool = True, firewall_keepalive: bool = False) -> None:
+        stage = "login"
+        targets = ["sip", "firewall"] if target == "all" else [target]
+        self.manifest.start_stage(stage, {"target": target})
+        self.events.emit(stage, "INFO", "stage_started", "starting local login helper", {"target": target})
+        for item in targets:
+            if item == "sip":
+                command = [
+                    sys.executable,
+                    str(self.config.root_dir / "situation-awareness" / "sangfor_login_session.py"),
+                    "--session-file",
+                    str(self.config.paths.sip_session_file),
+                ]
+                if sip_username:
+                    command.extend(["--username", sip_username])
+                command.append("--headless" if headless else "--no-headless")
+                stdout_path = self.artifacts.logs_dir / "login-sip.stdout.log"
+                stderr_path = self.artifacts.logs_dir / "login-sip.stderr.log"
+            else:
+                command = [
+                    sys.executable,
+                    str(self.config.root_dir / "firewall" / "sangfor_firewall_login_session.py"),
+                    "--session-file",
+                    str(self.config.paths.firewall_session_file),
+                ]
+                if firewall_username:
+                    command.extend(["--username", firewall_username])
+                command.append("--headless" if headless else "--no-headless")
+                command.append("--keepalive" if firewall_keepalive else "--no-keepalive")
+                stdout_path = self.artifacts.logs_dir / "login-firewall.stdout.log"
+                stderr_path = self.artifacts.logs_dir / "login-firewall.stderr.log"
+            result = run_subprocess(command, stdout_path=stdout_path, stderr_path=stderr_path)
+            if result.returncode != 0:
+                self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+                raise RuntimeError(f"{item} login failed with exit code {result.returncode}")
+            self.events.emit(stage, "INFO", "login_completed", f"{item} login completed", {"target": item})
+        self.manifest.finish_stage(stage, "completed", details={"target": target})
 
     def check_sessions(self) -> None:
         stage = "check-sessions"
