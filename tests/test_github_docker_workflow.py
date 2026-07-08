@@ -27,6 +27,7 @@ def test_docker_images_workflow_publishes_runtime_and_playwright_images():
     populate = workflow_jobs["build-and-push"]["steps"][1]
     assert populate["name"] == "Populate analyzer source"
     assert "https://github.com/atsud0/SXF_extract_attacker.git" in populate["run"]
+    assert "--branch main" in populate["run"]
     assert "c5ae8879ac34c3b13e8a0c49d1ef5f7d3c95b0fc" in populate["run"]
 
 
