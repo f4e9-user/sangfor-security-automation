@@ -1,5 +1,6 @@
 services:
   sip-keepalive:
+    image: ghcr.io/f4e9-user/sangfor-security-automation:playwright-latest
     build:
       context: .
       dockerfile: docker/Dockerfile.playwright
@@ -24,6 +25,7 @@ services:
     restart: unless-stopped
 
   firewall-keepalive:
+    image: ghcr.io/f4e9-user/sangfor-security-automation:playwright-latest
     build:
       context: .
       dockerfile: docker/Dockerfile.playwright
@@ -48,6 +50,7 @@ services:
     restart: unless-stopped
 
   pipeline:
+    image: ghcr.io/f4e9-user/sangfor-security-automation:latest
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -63,6 +66,7 @@ services:
       - ./secrets:/app/secrets:ro
 
   scheduler:
+    image: ghcr.io/f4e9-user/sangfor-security-automation:latest
     build:
       context: .
       dockerfile: docker/Dockerfile

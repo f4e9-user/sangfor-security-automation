@@ -22,3 +22,9 @@ def test_parser_keepalive_defaults():
     args = build_parser().parse_args([])
     assert args.keepalive
     assert args.keepalive_interval == 300
+
+
+def test_parser_defaults_to_project_secrets_session_file():
+    args = build_parser().parse_args([])
+    expected = Path(__file__).resolve().parents[1] / "secrets" / "firewall_session.json"
+    assert Path(args.session_file) == expected

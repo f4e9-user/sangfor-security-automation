@@ -1,0 +1,72 @@
+name: Docker Images
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: runtime
+            dockerfile: docker/Dockerfile
+            latest_tag: latest
+            suffix: ""
+          - name: playwright
+            dockerfile: docker/Dockerfile.playwright
+            latest_tag: playwright-latest
+            suffix: "-playwright"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT_SHA="${GITHUB_SHA::12}"
+          TAGS="${IMAGE}:sha-${SHORT_SHA}${{ matrix.image.suffix }}"
+          if [[ "${GITHUB_REF_TYPE}" == "branch" && ("${GITHUB_REF_NAME}" == "master" || "${GITHUB_REF_NAME}" == "main") ]]; then
+            TAGS+=$'\n'"${IMAGE}:${{ matrix.image.latest_tag }}"
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAGS+=$'\n'"${IMAGE}:${GITHUB_REF_NAME}${{ matrix.image.suffix }}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}

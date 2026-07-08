@@ -19,7 +19,8 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 DEFAULT_BASE_URL = "https://172.16.1.116"
-DEFAULT_SESSION_FILE = Path.home() / ".config" / "sangfor-firewall" / "session.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SESSION_FILE = PROJECT_ROOT / "secrets" / "firewall_session.json"
 DEFAULT_CAPTCHA_FILE = Path("/tmp/sangfor-firewall-login-captcha.png")
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 

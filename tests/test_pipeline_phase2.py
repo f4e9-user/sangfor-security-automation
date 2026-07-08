@@ -250,6 +250,39 @@ def test_check_sessions_command_returns_failure_for_missing_sessions(tmp_path):
     assert manifest["stages"]["check-sessions"]["status"] == "failed"
 
 
+def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypatch):
+    config_path = tmp_path / "pipeline.yaml"
+    sip_session = tmp_path / "secrets" / "sip_session.json"
+    firewall_session = tmp_path / "secrets" / "firewall_session.json"
+    config_path.write_text(
+        "paths:\n"
+        f"  sip_session_file: {sip_session}\n"
+        f"  firewall_session_file: {firewall_session}\n"
+        f"  runs_dir: {tmp_path / 'runs'}\n"
+        f"  state_dir: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run_subprocess(args, **kwargs):
+        calls.append(args)
+        from pipeline.commands import CommandResult
+
+        return CommandResult(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("pipeline.run_pipeline.run_subprocess", fake_run_subprocess)
+
+    exit_code = run_command(["--config", str(config_path), "login"])
+
+    assert exit_code == 0
+    assert len(calls) == 2
+    sip_index = calls[0].index("--session-file")
+    firewall_index = calls[1].index("--session-file")
+    assert calls[0][sip_index + 1] == str(sip_session)
+    assert calls[1][firewall_index + 1] == str(firewall_session)
+    assert "--no-keepalive" in calls[1]
+
+
 def test_schedule_window_calculates_previous_day_in_configured_timezone(tmp_path):
     config = PipelineConfig.from_dict(
         {
