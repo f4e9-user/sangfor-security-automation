@@ -16,6 +16,13 @@ from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+if __package__ in {None, ""}:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pipeline.login_credentials import load_login_credentials, recognize_captcha_with_chaojiying
+
 DEFAULT_BASE_URL = "https://172.16.1.118"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_FILE = PROJECT_ROOT / "secrets" / "sip_session.json"
@@ -153,8 +160,9 @@ def infer_xid(page, cookies: list[dict]) -> str:
 
 
 def login(args: argparse.Namespace) -> dict:
-    username = args.username or input("Sangfor username: ").strip()
-    password = getpass.getpass("Sangfor password: ")
+    credentials = load_login_credentials(args.credentials_file, "sip") if args.credentials_file else None
+    username = args.username or (credentials.username if credentials else "") or input("Sangfor username: ").strip()
+    password = credentials.password if credentials else getpass.getpass("Sangfor password: ")
     session_path = Path(args.session_file).expanduser()
     session_path.parent.mkdir(parents=True, exist_ok=True)
     captcha_path = Path(args.captcha_file).expanduser()
@@ -168,8 +176,19 @@ def login(args: argparse.Namespace) -> dict:
             page.locator('input[name="password"]').fill(password)
             captcha_img = page.locator('img[alt="点击刷新"]').first
             captcha_img.screenshot(path=str(captcha_path))
-            print_captcha_image(captcha_path)
-            captcha = input("Captcha: ").strip()
+            if args.captcha_provider == "chaojiying":
+                if credentials is None or credentials.chaojiying is None:
+                    raise RuntimeError("chaojiying captcha provider requires chaojiying credentials in --credentials-file")
+                captcha = recognize_captcha_with_chaojiying(
+                    captcha_path,
+                    username=credentials.chaojiying.username,
+                    password=credentials.chaojiying.password,
+                    softid=credentials.chaojiying.softid,
+                    codetype=args.chaojiying_codetype or credentials.chaojiying.codetype,
+                )
+            else:
+                print_captcha_image(captcha_path)
+                captcha = input("Captcha: ").strip()
             page.locator('input[name="captcha"]').fill(captcha)
             checkbox = page.locator('input[name="checkbox"]').first
             if not checkbox.is_checked():
@@ -203,6 +222,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-file", default=str(DEFAULT_SESSION_FILE))
     parser.add_argument("--captcha-file", default=str(DEFAULT_CAPTCHA_FILE))
     parser.add_argument("--username")
+    parser.add_argument("--credentials-file", help="GPG-encrypted JSON containing sip/firewall/chaojiying credentials")
+    parser.add_argument("--captcha-provider", choices=("manual", "chaojiying"), default="manual")
+    parser.add_argument("--chaojiying-codetype", help="Override Chaojiying codetype, e.g. 1004")
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     return parser
 

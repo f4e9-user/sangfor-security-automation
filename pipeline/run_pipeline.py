@@ -48,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--target", choices=("all", "sip", "firewall"), default="all")
     login.add_argument("--sip-username")
     login.add_argument("--firewall-username")
+    login.add_argument("--credentials-file", help="GPG-encrypted JSON containing sip/firewall/chaojiying credentials")
+    login.add_argument("--captcha-provider", choices=("manual", "chaojiying"), default="manual")
+    login.add_argument("--chaojiying-codetype", help="Override Chaojiying codetype, e.g. 1004")
     login.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     login.add_argument("--firewall-keepalive", action=argparse.BooleanOptionalAction, default=False)
 
@@ -94,7 +97,16 @@ def run_command(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "login":
-            runner.login(args.target, sip_username=args.sip_username, firewall_username=args.firewall_username, headless=args.headless, firewall_keepalive=args.firewall_keepalive)
+            runner.login(
+                args.target,
+                sip_username=args.sip_username,
+                firewall_username=args.firewall_username,
+                credentials_file=args.credentials_file,
+                captcha_provider=args.captcha_provider,
+                chaojiying_codetype=args.chaojiying_codetype,
+                headless=args.headless,
+                firewall_keepalive=args.firewall_keepalive,
+            )
         elif args.command == "check-sessions":
             runner.check_sessions()
         elif args.command == "export-logs":
@@ -125,7 +137,18 @@ class PipelineRunner:
         self.manifest = manifest
         self.events = events
 
-    def login(self, target: str = "all", *, sip_username: str | None = None, firewall_username: str | None = None, headless: bool = True, firewall_keepalive: bool = False) -> None:
+    def login(
+        self,
+        target: str = "all",
+        *,
+        sip_username: str | None = None,
+        firewall_username: str | None = None,
+        credentials_file: str | None = None,
+        captcha_provider: str = "manual",
+        chaojiying_codetype: str | None = None,
+        headless: bool = True,
+        firewall_keepalive: bool = False,
+    ) -> None:
         stage = "login"
         targets = ["sip", "firewall"] if target == "all" else [target]
         self.manifest.start_stage(stage, {"target": target})
@@ -140,6 +163,11 @@ class PipelineRunner:
                 ]
                 if sip_username:
                     command.extend(["--username", sip_username])
+                if credentials_file:
+                    command.extend(["--credentials-file", credentials_file])
+                command.extend(["--captcha-provider", captcha_provider])
+                if chaojiying_codetype:
+                    command.extend(["--chaojiying-codetype", chaojiying_codetype])
                 command.append("--headless" if headless else "--no-headless")
                 stdout_path = self.artifacts.logs_dir / "login-sip.stdout.log"
                 stderr_path = self.artifacts.logs_dir / "login-sip.stderr.log"
@@ -152,6 +180,11 @@ class PipelineRunner:
                 ]
                 if firewall_username:
                     command.extend(["--username", firewall_username])
+                if credentials_file:
+                    command.extend(["--credentials-file", credentials_file])
+                command.extend(["--captcha-provider", captcha_provider])
+                if chaojiying_codetype:
+                    command.extend(["--chaojiying-codetype", chaojiying_codetype])
                 command.append("--headless" if headless else "--no-headless")
                 command.append("--keepalive" if firewall_keepalive else "--no-keepalive")
                 stdout_path = self.artifacts.logs_dir / "login-firewall.stdout.log"
