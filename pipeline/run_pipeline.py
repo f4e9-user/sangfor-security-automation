@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Sangfor security automation pipeline")
     parser.add_argument("--config", help="pipeline YAML config path")
     parser.add_argument("--run-id", help="reuse or create a specific run id")
+    parser.add_argument("--debug", action="store_true", help="print DEBUG events and detailed run context to the console")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     login = subparsers.add_parser("login")
@@ -93,8 +94,10 @@ def run_command(argv: list[str] | None = None) -> int:
     config = PipelineConfig.load(args.config)
     artifacts = ArtifactStore(config.paths.runs_dir, config.paths.state_dir).create_run(args.run_id)
     manifest = RunManifest(artifacts.run_dir, artifacts.run_id, vars(args))
-    events = EventLogger(artifacts.run_dir, artifacts.run_id)
+    events = EventLogger(artifacts.run_dir, artifacts.run_id, console=sys.stdout, console_level="DEBUG" if args.debug else "INFO")
     runner = PipelineRunner(config, artifacts, manifest, events)
+    print(f"Run ID: {artifacts.run_id}", flush=True)
+    print(f"Run dir: {artifacts.run_dir}", flush=True)
 
     try:
         if args.command == "login":
@@ -124,11 +127,17 @@ def run_command(argv: list[str] | None = None) -> int:
         elif args.command == "scheduled":
             runner.scheduled(args.job_name, apply=args.apply)
         manifest.finish("completed")
+        print("Status: completed", flush=True)
+        print(f"Events: {events.path}", flush=True)
+        print(f"Pipeline log: {events.pipeline_log_path}", flush=True)
         return 0
     except Exception as exc:
         manifest.finish("failed", error=exc)
         events.emit(args.command, "ERROR", "pipeline_failed", str(exc), {"error_type": type(exc).__name__})
         print(str(exc), file=sys.stderr)
+        print("Status: failed", flush=True)
+        print(f"Events: {events.path}", flush=True)
+        print(f"Pipeline log: {events.pipeline_log_path}", flush=True)
         return 1
 
 
@@ -230,6 +239,7 @@ class PipelineRunner:
         stage = "export-logs"
         self.manifest.start_stage(stage, {"start": start, "end": end})
         favorite = favorite_name or "3"
+        self.events.emit(stage, "INFO", "stage_started", "exporting SIP logs", {"start": start, "end": end, "favorite_name": favorite})
         command = export_logs_command(
             self.config.root_dir,
             self.config.paths.sip_session_file,
@@ -246,6 +256,7 @@ class PipelineRunner:
         )
         if result.returncode != 0:
             self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+            self.events.emit(stage, "ERROR", "stage_failed", "export SIP logs failed", {"returncode": result.returncode})
             raise RuntimeError(f"export-logs failed with exit code {result.returncode}")
         latest = find_latest_file(self.artifacts.exports_dir, "*.xlsx")
         self.manifest.set_output("exported_xlsx", str(latest))
@@ -256,6 +267,7 @@ class PipelineRunner:
     def export_firewall_blacklist(self) -> Path:
         stage = "export-firewall-blacklist"
         self.manifest.start_stage(stage)
+        self.events.emit(stage, "INFO", "stage_started", "exporting firewall blacklist")
         command = export_firewall_blacklist_command(self.config.root_dir, self.config.paths.firewall_session_file, self.artifacts.blacklist_dir)
         result = run_subprocess(
             command,
@@ -264,6 +276,7 @@ class PipelineRunner:
         )
         if result.returncode != 0:
             self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+            self.events.emit(stage, "ERROR", "stage_failed", "export firewall blacklist failed", {"returncode": result.returncode})
             raise RuntimeError(f"export-firewall-blacklist failed with exit code {result.returncode}")
         output = self.artifacts.blacklist_dir / "sangfor_firewall_blacklists.csv"
         self.manifest.set_output("firewall_blacklist", str(output))
@@ -271,12 +284,13 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "exported firewall blacklist", {"blacklist": str(output)})
         return output
 
-    def analyze(self, xlsx: Path | None = None, blacklist: Path | None = None) -> Path:
+    def analyze(self, xlsx: Path | None = None, blacklist: Path | None = None, *, persist_history: bool = False) -> Path:
         stage = "analyze"
         xlsx = xlsx or find_latest_file(self.artifacts.exports_dir, "*.xlsx")
         blacklist = blacklist or self.artifacts.blacklist_dir / "sangfor_firewall_blacklists.csv"
-        self.manifest.start_stage(stage, {"xlsx": str(xlsx), "blacklist": str(blacklist)})
-        command, cwd = analyze_command(self.config.root_dir, xlsx, blacklist, self.config.analysis.db_path, self.config.analysis.whitelist_file, self.artifacts.analysis_dir)
+        self.manifest.start_stage(stage, {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
+        self.events.emit(stage, "INFO", "stage_started", "running attacker analysis", {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
+        command, cwd = analyze_command(self.config.root_dir, xlsx, blacklist, self.config.analysis.db_path, self.config.analysis.whitelist_file, self.artifacts.analysis_dir, persist_history=persist_history)
         result = run_subprocess(
             command,
             cwd=cwd,
@@ -285,6 +299,7 @@ class PipelineRunner:
         )
         if result.returncode != 0:
             self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+            self.events.emit(stage, "ERROR", "stage_failed", "attacker analysis failed", {"returncode": result.returncode})
             raise RuntimeError(f"analyze failed with exit code {result.returncode}")
         raw = copy_analyzer_output(self.config.root_dir, self.artifacts.analysis_dir, xlsx)
         normalized = self.artifacts.analysis_dir / "blocklist_recommendations.normalized.csv"
@@ -301,6 +316,7 @@ class PipelineRunner:
         recommendations = recommendations or self.artifacts.analysis_dir / "blocklist_recommendations.normalized.csv"
         apply = bool(apply)
         self.manifest.start_stage(stage, {"recommendations": str(recommendations), "apply": apply, "manual_override_reason": manual_override_reason or ""})
+        self.events.emit(stage, "INFO", "stage_started", "selecting block targets", {"recommendations": str(recommendations), "apply": apply})
         if apply:
             self._check_apply_prerequisites(recommendations, explicit_recommendations=explicit_recommendations)
         selection = select_block_targets(
@@ -323,10 +339,12 @@ class PipelineRunner:
         self.manifest.set_output("block_apply_result", str(apply_result_path))
         if apply and selection.apply_refusal:
             self.manifest.finish_stage(stage, "failed", error=selection.apply_refusal)
+            self.events.emit(stage, "ERROR", "stage_failed", "apply refused", {"reason": selection.apply_refusal})
             raise RuntimeError(f"apply refused: {selection.apply_refusal}")
         if apply and selection.targets:
             if not targets_path.read_text(encoding="utf-8").strip():
                 self.manifest.finish_stage(stage, "failed", error="empty target file")
+                self.events.emit(stage, "ERROR", "stage_failed", "apply refused", {"reason": "empty target file"})
                 raise RuntimeError("apply refused: empty target file")
             command = block_command(
                 self.config.root_dir,
@@ -344,22 +362,25 @@ class PipelineRunner:
             self.manifest.set_output("block_apply_result", str(apply_result_path))
             if result.returncode != 0:
                 self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+                self.events.emit(stage, "ERROR", "stage_failed", "block apply failed", {"returncode": result.returncode})
                 raise RuntimeError(f"block apply failed with exit code {result.returncode}")
         self.manifest.finish_stage(stage, "completed", details={"target_count": len(selection.targets), "apply": apply})
         self.events.emit(stage, "INFO", "stage_completed", "selected block targets", {"target_count": len(selection.targets), "apply": apply})
         return selection.targets
 
     def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False) -> None:
+        self.events.emit("full", "INFO", "stage_started", "starting full pipeline", {"start": start, "end": end, "apply": apply})
         self.check_sessions()
         xlsx = self.export_logs(start, end, favorite_name, export_date)
         blacklist = self.export_firewall_blacklist()
-        recommendations = self.analyze(xlsx, blacklist)
+        recommendations = self.analyze(xlsx, blacklist, persist_history=apply)
         self.block(recommendations, apply=False)
         if apply:
             self.block(recommendations, apply=True)
         md_path, json_path = write_daily_report(self.artifacts.run_dir, self.manifest.data, recommendations, log_window=(start, end))
         self.manifest.set_output("daily_report_md", str(md_path))
         self.manifest.set_output("daily_report_json", str(json_path))
+        self.events.emit("full", "INFO", "stage_completed", "full pipeline completed", {"report": str(md_path), "report_json": str(json_path)})
 
     def scheduled(self, job_name: str, *, apply: bool = False) -> None:
         stage = "scheduled"
