@@ -1,0 +1,16 @@
+{
+  "sip": {
+    "username": "态势感知账号",
+    "password": "态势感知密码"
+  },
+  "firewall": {
+    "username": "防火墙账号",
+    "password": "防火墙密码"
+  },
+  "chaojiying": {
+    "username": "超级鹰账号",
+    "password": "超级鹰密码，程序会自动转 md5 后作为 pass2 发送",
+    "softid": "96001",
+    "codetype": "1004"
+  }
+}

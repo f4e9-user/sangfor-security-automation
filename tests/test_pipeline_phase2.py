@@ -252,6 +252,7 @@ def test_check_sessions_command_returns_failure_for_missing_sessions(tmp_path):
 
 def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypatch):
     config_path = tmp_path / "pipeline.yaml"
+    credentials_file = tmp_path / "login.json.gpg"
     sip_session = tmp_path / "secrets" / "sip_session.json"
     firewall_session = tmp_path / "secrets" / "firewall_session.json"
     config_path.write_text(
@@ -272,7 +273,17 @@ def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypat
 
     monkeypatch.setattr("pipeline.run_pipeline.run_subprocess", fake_run_subprocess)
 
-    exit_code = run_command(["--config", str(config_path), "login"])
+    exit_code = run_command([
+        "--config",
+        str(config_path),
+        "login",
+        "--credentials-file",
+        str(credentials_file),
+        "--captcha-provider",
+        "chaojiying",
+        "--chaojiying-codetype",
+        "1902",
+    ])
 
     assert exit_code == 0
     assert len(calls) == 2
@@ -280,6 +291,13 @@ def test_login_command_uses_configured_project_session_paths(tmp_path, monkeypat
     firewall_index = calls[1].index("--session-file")
     assert calls[0][sip_index + 1] == str(sip_session)
     assert calls[1][firewall_index + 1] == str(firewall_session)
+    for call in calls:
+        credentials_index = call.index("--credentials-file")
+        provider_index = call.index("--captcha-provider")
+        codetype_index = call.index("--chaojiying-codetype")
+        assert call[credentials_index + 1] == str(credentials_file)
+        assert call[provider_index + 1] == "chaojiying"
+        assert call[codetype_index + 1] == "1902"
     assert "--no-keepalive" in calls[1]
 
 
