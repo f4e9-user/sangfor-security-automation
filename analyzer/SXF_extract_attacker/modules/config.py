@@ -1,12 +1,17 @@
 """配置模块 - 管理IP排除列表和其他配置项"""
 
 import os
-from typing import Dict
+from typing import Dict, Optional
 
-def load_excluded_ips() -> Dict[str, str]:
-    """从文件加载排除IP列表"""
+def load_excluded_ips(ip_file_path: Optional[str] = None) -> Dict[str, str]:
+    """从文件加载排除IP列表。
+
+    传入 ``ip_file_path`` 时读取该文件（pipeline 统一指向 secrets/ip_whitelist.txt）；
+    否则回退到模块自带的 config/ip_whitelist.txt，保证分析器可独立运行。
+    """
     excluded_ips = {}
-    ip_file_path = os.path.join(os.path.dirname(__file__), "..", "config", "ip_whitelist.txt")
+    if ip_file_path is None:
+        ip_file_path = os.path.join(os.path.dirname(__file__), "..", "config", "ip_whitelist.txt")
     if os.path.exists(ip_file_path):
         with open(ip_file_path, 'r', encoding='utf-8') as f:
             for line in f:

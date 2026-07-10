@@ -101,7 +101,7 @@ def export_firewall_blacklist_command(root: Path, session_file: Path, output_dir
     ]
 
 
-def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whitelist_file: Path, output_dir: Path, *, persist_history: bool = False) -> tuple[list[str], Path]:
+def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whitelist_file: Path, output_dir: Path, *, persist_history: bool = False, stats_out: str | Path | None = None) -> tuple[list[str], Path]:
     analyzer_dir = root / "analyzer" / "SXF_extract_attacker"
     command = [
         sys.executable,
@@ -113,6 +113,10 @@ def analyze_command(root: Path, xlsx: Path, blacklist: Path, db_path: Path, whit
         "--local-analyze",
         "--blocklist",
     ]
+    if whitelist_file:
+        command.extend(["--whitelist-file", str(whitelist_file)])
+    if stats_out:
+        command.extend(["--stats-out", str(stats_out)])
     if not persist_history:
         command.append("--no-db")
     command.extend([
@@ -301,13 +305,20 @@ def _truncate(value: str, limit: int = 500) -> str:
 
 
 def _load_whitelist(path: str | Path | None) -> set[str]:
+    """Load whitelist IPs from a file. Accepts both ``IP,reason`` (one IP per
+    line, reason after the first comma) and plain ``IP`` per line; ``#`` comments
+    and blank lines are ignored. Returns just the IP set so ``ip in whitelist``
+    matches correctly."""
     if not path or not Path(path).exists():
         return set()
     entries = set()
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
-            entries.add(line)
+        if not line or line.startswith("#"):
+            continue
+        ip = line.split(",", 1)[0].strip()
+        if ip:
+            entries.add(ip)
     return entries
 
 

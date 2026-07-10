@@ -2,9 +2,12 @@
 
 import argparse
 import json
+import sys
+from collections import Counter
 from datetime import datetime
 from os.path import basename
-from modules.config import EXCLUDED_IPS, DEFAULT_DB_PATH
+from typing import Any
+from modules.config import EXCLUDED_IPS, DEFAULT_DB_PATH, load_excluded_ips
 from modules.data_processor import load_blacklist, detect_report_type, read_excel_file, save_to_csv
 from modules.output_paths import build_report_output_path, build_blocklist_output_path
 from modules.security_analyzer import process_af_report, process_sip_report, find_af_columns, print_statistics, print_exclusion_info, save_to_database
@@ -43,12 +46,76 @@ def _print_ai_results(result):
     print(f"{'='*60}")
 
 
+def _to_native(value: Any) -> Any:
+    """递归把 pandas/numpy/Counter 等转成 JSON 原生类型。"""
+    if isinstance(value, Counter):
+        return {str(k): _to_native(v) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {str(k): _to_native(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_native(v) for v in value]
+    if isinstance(value, (str, bool)) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value
+    # numpy 标量等：尝试转 int/float，失败则转 str
+    try:
+        if hasattr(value, "item"):
+            return _to_native(value.item())
+    except Exception:
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _series_to_top(series: Any, key_name: str) -> list[dict[str, Any]]:
+    """pandas Series (index=标签, value=计数) → [{key_name, count}, ...]。"""
+    items = series.to_dict().items() if hasattr(series, "to_dict") else dict(series).items()
+    return [{key_name: str(k), "count": int(v)} for k, v in items]
+
+
+def _write_stats(stats_out: str, df: Any, df_for_stats: Any, top_threats: Any,
+                 top_ips: Any, local_results: dict | None) -> None:
+    """把结构化统计写为 JSON，供 pipeline 日报/控制台摘要消费。"""
+    if not stats_out:
+        return
+    total_records = int(len(df))
+    excluded_count = int(len(df) - len(df_for_stats)) if df_for_stats is not None else 0
+    stats: dict[str, Any] = {
+        "total_records": total_records,
+        "excluded_count": excluded_count,
+        "threat_type_top10": _series_to_top(top_threats, "type") if top_threats is not None else [],
+        "source_ip_top10": _series_to_top(top_ips, "ip") if top_ips is not None else [],
+    }
+    if local_results:
+        for field in ("attack_results", "defense_posture", "temporal_patterns", "attack_chains"):
+            if local_results.get(field):
+                stats[field] = _to_native(local_results[field])
+    try:
+        with open(stats_out, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        print(f"\n📝 结构化统计已写出: {stats_out}")
+    except Exception as e:
+        print(f"\n⚠️ 写出统计失败: {e}", file=sys.stderr)
+
+
 def process_xlsx(input_file, output_csv=None, exclude_from_csv=False, blacklist_file=None,
                  db_path=None, enable_db_logging=True, enable_local_analysis=False,
-                 enable_ai_analysis=False, enable_blocklist=False):
+                 enable_ai_analysis=False, enable_blocklist=False, whitelist_file=None,
+                 stats_out=None):
     """处理XLSX文件的主函数"""
-    # 合并排除项
-    excluded_ips = EXCLUDED_IPS.copy()
+    # 合并排除项（whitelist_file 由 pipeline 指向统一的 secrets/ip_whitelist.txt；
+    # 未传则回退到模块自带白名单，保证分析器可独立运行）
+    excluded_ips = load_excluded_ips(whitelist_file) if whitelist_file else EXCLUDED_IPS.copy()
     blacklist_dict = load_blacklist(blacklist_file)
     excluded_ips.update(blacklist_dict)
 
@@ -80,6 +147,7 @@ def process_xlsx(input_file, output_csv=None, exclude_from_csv=False, blacklist_
     print_exclusion_info(exclude_from_csv, excluded_any)
 
     # 本地攻击特征分析
+    local_results = None
     if enable_local_analysis:
         try:
             from modules.local_analyzer import LocalAnalyzer
@@ -147,6 +215,10 @@ def process_xlsx(input_file, output_csv=None, exclude_from_csv=False, blacklist_
     # 保存结果
     save_to_csv(df_final, output_csv)
 
+    # 写出结构化统计（pipeline 日报/控制台摘要消费）
+    if stats_out and df_for_stats is not None:
+        _write_stats(stats_out, df, df_for_stats, top_threats, top_ips, local_results)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -188,6 +260,16 @@ def main():
         action="store_true",
         help="生成封禁建议清单：对每个IP打分+取证，输出到 outputs/<原文件名>_blocklist_recommendations.csv"
     )
+    parser.add_argument(
+        "--whitelist-file",
+        default=None,
+        help="排除IP白名单文件路径（IP,原因 每行一条）。不传则用模块自带 config/ip_whitelist.txt",
+    )
+    parser.add_argument(
+        "--stats-out",
+        default=None,
+        help="将结构化统计（总记录/排除数/Top威胁/Top源IP/防御态势/攻击链）写为 JSON 到该路径",
+    )
     args = parser.parse_args()
     process_xlsx(
         input_file=args.input_file,
@@ -199,4 +281,6 @@ def main():
         enable_local_analysis=args.local_analyze,
         enable_ai_analysis=args.ai_analyze,
         enable_blocklist=args.blocklist,
+        whitelist_file=args.whitelist_file,
+        stats_out=args.stats_out,
     )

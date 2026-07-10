@@ -228,12 +228,13 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
 
 
 def test_analyze_command_can_disable_or_enable_history_persistence(tmp_path):
+    whitelist = tmp_path / "ip_whitelist.txt"
     command, cwd = analyze_command(
         tmp_path,
         tmp_path / "logs.xlsx",
         tmp_path / "blacklist.csv",
         tmp_path / "attackers.db",
-        tmp_path / "ip_whitelist.txt",
+        whitelist,
         tmp_path / "analysis",
         persist_history=False,
     )
@@ -241,17 +242,120 @@ def test_analyze_command_can_disable_or_enable_history_persistence(tmp_path):
     assert cwd == tmp_path / "analyzer" / "SXF_extract_attacker"
     assert "--blocklist" in command
     assert "--no-db" in command
+    # whitelist_file is now actually forwarded to the analyzer
+    assert "--whitelist-file" in command
+    assert command[command.index("--whitelist-file") + 1] == str(whitelist)
+    # stats_out omitted when not requested
+    assert "--stats-out" not in command
 
+    stats_path = tmp_path / "analysis" / "stats.json"
     apply_command, _ = analyze_command(
         tmp_path,
         tmp_path / "logs.xlsx",
         tmp_path / "blacklist.csv",
         tmp_path / "attackers.db",
-        tmp_path / "ip_whitelist.txt",
+        whitelist,
         tmp_path / "analysis",
         persist_history=True,
+        stats_out=stats_path,
     )
     assert "--no-db" not in apply_command
+    assert apply_command[apply_command.index("--stats-out") + 1] == str(stats_path)
+
+
+def test_load_whitelist_parses_ip_reason_format(tmp_path):
+    from pipeline.commands import _load_whitelist
+
+    wl = tmp_path / "ip_whitelist.txt"
+    wl.write_text(
+        "# comment line\n"
+        "58.248.69.44,出口IP\n"
+        "183.129.153.150,百度爬虫，良性流量\n"
+        "1.2.3.4\n",
+        encoding="utf-8",
+    )
+    entries = _load_whitelist(wl)
+    assert entries == {"58.248.69.44", "183.129.153.150", "1.2.3.4"}
+    # reasons must not leak into the IP set
+    assert all("," not in ip for ip in entries)
+
+
+def test_write_daily_report_includes_stats_dimensions(tmp_path):
+    run_dir = tmp_path / "runs" / "20260710_172704"
+    (run_dir / "analysis").mkdir(parents=True)
+    (run_dir / "analysis" / "blocklist_recommendations.normalized.csv").write_text(
+        "ip,recommendation,final_score,base_score,history_score,attack_count,threat_types,severity,attack_chain,evidence_summary,sample_urls,historical_occurrences,recommendation_reasons,source_report,already_blacklisted,blocked_this_run,skip_reason\n"
+        "9.9.9.9,建议封禁,64,50,14,70,信息泄露,高危,信息窃取,证据,url,0,理由,report.xlsx,false,true,\n",
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "stats.json").write_text(
+        json.dumps({
+            "total_records": 6300,
+            "excluded_count": 1306,
+            "threat_type_top10": [{"type": "爬虫工具", "count": 1892}, {"type": "信息泄露", "count": 702}],
+            "source_ip_top10": [{"ip": "159.75.172.163", "count": 233}, {"ip": "34.96.63.75", "count": 208}],
+            "attack_results": {"success_rate": 0.0, "blocked_rate": 0.0, "distribution": {"攻击失败": 6300}},
+            "defense_posture": {"waf_block_rate": 0.0, "whitelist_hit_rate": 0.0, "critical_high_ratio": 0.302},
+            "temporal_patterns": {"span_hours": 54.9, "peak_hour": 13, "peak_count": 846, "attacks_per_hour": 114.8},
+            "attack_chains": [{"ip": "31.132.90.3", "total_attacks": 314, "unique_threat_types": 7, "attack_stages": ["漏洞利用", "WebShell投递"]}],
+        }),
+        encoding="utf-8",
+    )
+    manifest = {
+        "run_id": "20260710_172704",
+        "stages": {"check-sessions": {"status": "completed"}},
+        "outputs": {"exported_xlsx": "report.xlsx", "firewall_blacklist": "blacklist.csv"},
+    }
+
+    md_path, json_path = write_daily_report(run_dir, manifest, run_dir / "analysis" / "blocklist_recommendations.normalized.csv", log_window=("2026-07-08 10:30:00", "2026-07-10 17:30:00"))
+    markdown = md_path.read_text(encoding="utf-8")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert "Analyzed logs: 6300" in markdown
+    assert "Excluded logs (whitelist/blacklist): 1306" in markdown
+    assert payload["analyzed_log_count"] == 6300
+    assert payload["excluded_log_count"] == 1306
+    assert "## Top threat types" in markdown and "爬虫工具: 1892" in markdown
+    assert "## Top source IPs" in markdown and "159.75.172.163: 233" in markdown
+    assert "## Defense posture" in markdown and "Attack success rate: 0.0%" in markdown
+    assert "## Attack chains" in markdown and "31.132.90.3" in markdown and "漏洞利用 → WebShell投递" in markdown
+
+
+def test_print_console_report_includes_stats_dimensions(tmp_path):
+    import io
+
+    from pipeline.reports import print_console_report
+
+    run_dir = tmp_path / "runs" / "20260710_172704"
+    (run_dir / "reports").mkdir(parents=True)
+    (run_dir / "analysis").mkdir(parents=True)
+    (run_dir / "analysis" / "blocklist_recommendations.normalized.csv").write_text(
+        "ip,recommendation,final_score,base_score,history_score,attack_count,threat_types,severity,attack_chain,evidence_summary,sample_urls,historical_occurrences,recommendation_reasons,source_report,already_blacklisted,blocked_this_run,skip_reason\n"
+        "9.9.9.9,建议封禁,64,50,14,70,信息泄露,高危,信息窃取,证据,url,0,理由,report.xlsx,false,true,\n",
+        encoding="utf-8",
+    )
+    (run_dir / "analysis" / "stats.json").write_text(
+        json.dumps({
+            "total_records": 6300,
+            "excluded_count": 1306,
+            "threat_type_top10": [{"type": "爬虫工具", "count": 1892}],
+            "source_ip_top10": [{"ip": "159.75.172.163", "count": 233}],
+            "attack_results": {"success_rate": 0.0, "blocked_rate": 0.0},
+            "defense_posture": {"waf_block_rate": 0.0, "critical_high_ratio": 0.302},
+            "temporal_patterns": {"peak_hour": 13, "peak_count": 846, "attacks_per_hour": 114.8},
+            "attack_chains": [{"ip": "31.132.90.3", "total_attacks": 314, "attack_stages": ["漏洞利用", "WebShell投递"]}],
+        }),
+        encoding="utf-8",
+    )
+    buf = io.StringIO()
+    print_console_report(run_dir, stream=buf)
+    out = buf.getvalue()
+
+    assert "分析日志: 6300 条（排除白/黑名单 1306 条）" in out
+    assert "威胁 Top: 爬虫工具 1892" in out
+    assert "源IP Top: 159.75.172.163 233" in out
+    assert "防御态势:" in out and "高危占比 30.2%" in out
+    assert "攻击链: 31.132.90.3 (314次): 漏洞利用→WebShell投递" in out
 
 
 def test_select_block_targets_defaults_to_dry_run_and_skips_monitoring_whitelist_and_blacklist(tmp_path):

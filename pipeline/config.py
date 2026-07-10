@@ -109,7 +109,7 @@ class PipelineConfig:
         levels = analysis_data.get("recommendation_levels") or ["立即封禁", "建议封禁"]
         analysis = AnalysisConfig(
             db_path=_resolve_path(analysis_data.get("db_path", default_db), root),
-            whitelist_file=_resolve_path(analysis_data.get("whitelist_file", "config/ip_whitelist.txt"), root),
+            whitelist_file=_resolve_path(analysis_data.get("whitelist_file", "secrets/ip_whitelist.txt"), root),
             recommendation_levels=tuple(str(item) for item in levels),
             min_final_score=int(analysis_data.get("min_final_score", 45)),
         )

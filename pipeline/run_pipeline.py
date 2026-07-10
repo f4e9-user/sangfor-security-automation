@@ -336,7 +336,7 @@ class PipelineRunner:
         blacklist = blacklist or self.artifacts.blacklist_dir / "sangfor_firewall_blacklists.csv"
         self.manifest.start_stage(stage, {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
         self.events.emit(stage, "INFO", "stage_started", "running attacker analysis", {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
-        command, cwd = analyze_command(self.config.root_dir, xlsx, blacklist, self.config.analysis.db_path, self.config.analysis.whitelist_file, self.artifacts.analysis_dir, persist_history=persist_history)
+        command, cwd = analyze_command(self.config.root_dir, xlsx, blacklist, self.config.analysis.db_path, self.config.analysis.whitelist_file, self.artifacts.analysis_dir, persist_history=persist_history, stats_out=self.artifacts.analysis_dir / "stats.json")
         result = run_subprocess(
             command,
             cwd=cwd,
@@ -347,6 +347,9 @@ class PipelineRunner:
             self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
             self.events.emit(stage, "ERROR", "stage_failed", "attacker analysis failed", {"returncode": result.returncode})
             raise RuntimeError(f"analyze failed with exit code {result.returncode}")
+        stats_path = self.artifacts.analysis_dir / "stats.json"
+        if stats_path.exists():
+            self.manifest.set_output("analysis_stats", str(stats_path))
         raw = copy_analyzer_output(self.config.root_dir, self.artifacts.analysis_dir, xlsx)
         normalized = self.artifacts.analysis_dir / "blocklist_recommendations.normalized.csv"
         normalize_recommendations(raw, normalized, source_report=xlsx)

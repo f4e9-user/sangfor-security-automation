@@ -21,7 +21,7 @@ firewall:
 
 analysis:
   db_path: data/attackers.db
-  whitelist_file: config/ip_whitelist.txt
+  whitelist_file: secrets/ip_whitelist.txt
   recommendation_levels:
     - 立即封禁
     - 建议封禁
