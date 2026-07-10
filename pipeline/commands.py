@@ -56,8 +56,12 @@ class BlockSelection:
 
 def run_subprocess(args: list[str], *, cwd: str | Path | None = None, stdout_path: Path | None = None, stderr_path: Path | None = None) -> CommandResult:
     completed = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
-    stdout = redact_secrets(completed.stdout)
-    stderr = redact_secrets(completed.stderr)
+    # Keep URLs/IPs/device addresses visible in the captured log files so errors
+    # like "net::ERR_EMPTY_RESPONSE at https://192.0.2.118/ui/" are diagnosable.
+    # Credentials (cookies/tokens/passwords) are still redacted. Callers that
+    # store this output into manifests/events re-redact strictly (see state.py).
+    stdout = redact_secrets(completed.stdout, keep_urls=True)
+    stderr = redact_secrets(completed.stderr, keep_urls=True)
     if stdout_path:
         stdout_path.write_text(stdout, encoding="utf-8")
     if stderr_path:

@@ -1,5 +1,6 @@
 import csv
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -68,6 +69,50 @@ def test_redaction_removes_headers_json_fields_and_cli_values():
     assert "firewall.local" not in redacted
     assert "10.0.0.8" not in redacted
     assert redacted.count("[REDACTED]") >= 10
+
+
+def test_redact_secrets_keep_urls_shows_device_url_but_hides_credentials():
+    payload = (
+        "Page.goto: net::ERR_EMPTY_RESPONSE at https://192.0.2.118/ui/\n"
+        'Cookie: SESSID=secret-cookie\n'
+        '{"base_url": "https://192.0.2.118", "cookie": "raw-cookie"}\n'
+        "--base-url https://192.0.2.118 --password pass123 token=kv-token\n"
+    )
+    redacted = redact_secrets(payload, keep_urls=True)
+    # device URL/IP/base_url stay visible so the error is diagnosable
+    assert "https://192.0.2.118" in redacted
+    assert "192.0.2.118" in redacted
+    assert "/ui/" in redacted
+    assert "--base-url https://192.0.2.118" in redacted
+    # credentials are still hidden
+    assert "secret-cookie" not in redacted
+    assert "raw-cookie" not in redacted
+    assert "pass123" not in redacted
+    assert "kv-token" not in redacted
+    assert "[REDACTED]" in redacted
+    # strict mode (default) still hides the device URL
+    assert "192.0.2.118" not in redact_secrets(payload)
+
+
+def test_run_subprocess_keeps_urls_in_stderr_log(tmp_path):
+    from pipeline.commands import run_subprocess
+
+    stderr_path = tmp_path / "login-sip.stderr.log"
+    result = run_subprocess(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('net::ERR_EMPTY_RESPONSE at https://192.0.2.118/ui/\\nCookie: SESSID=secret\\n'); sys.exit(1)",
+        ],
+        stderr_path=stderr_path,
+    )
+
+    text = stderr_path.read_text(encoding="utf-8")
+    assert "https://192.0.2.118/ui/" in text
+    assert "SESSID=secret" not in text
+    # the returned value also keeps the URL (callers re-redact strictly when storing)
+    assert "192.0.2.118" in result.stderr
+    assert result.returncode == 1
 
 
 def test_pipeline_config_loads_target_base_urls(tmp_path):
