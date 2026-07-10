@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -27,7 +28,7 @@ from .commands import (
     write_block_artifacts,
 )
 from .config import PipelineConfig, schedule_window
-from .reports import write_daily_report
+from .reports import print_console_report, read_exported_log_count, write_daily_report
 from .sessions import (
     MissingSessionError,
     check_firewall_session_health,
@@ -81,16 +82,54 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--favorite-name", default=None)
     full.add_argument("--export-date", default=None)
     full.add_argument("--apply", action="store_true")
+    full.add_argument("--report", action="store_true", help="print a console summary after completion")
 
     scheduled = subparsers.add_parser("scheduled")
     scheduled.add_argument("job_name")
     scheduled.add_argument("--apply", action="store_true")
+    scheduled.add_argument("--report", action="store_true", help="print a console summary after completion")
+
+    report = subparsers.add_parser("report", help="print a console summary for the latest or a given run (read-only)")
+    report.add_argument("--run-id", default=None, help="run id to summarize; defaults to the latest run")
     return parser
+
+
+def _resolve_run_dir(config: "PipelineConfig", run_id: str | None) -> Path:
+    runs_dir = config.paths.runs_dir
+    if run_id:
+        run_dir = runs_dir / run_id
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"run not found: {run_dir}")
+        return run_dir
+    latest = config.paths.state_dir / "latest.json"
+    if latest.is_file():
+        try:
+            data = json.loads(latest.read_text(encoding="utf-8"))
+            rid = data.get("run_id")
+            if rid:
+                candidate = runs_dir / str(rid)
+                if candidate.is_dir():
+                    return candidate
+        except (OSError, ValueError):
+            pass
+    candidates = sorted((p for p in runs_dir.glob("*") if p.is_dir()), reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"no runs found under {runs_dir}")
+    return candidates[0]
+
+
+def _run_report_command(args: argparse.Namespace) -> int:
+    config = PipelineConfig.load(args.config)
+    run_dir = _resolve_run_dir(config, args.run_id)
+    print_console_report(run_dir)
+    return 0
 
 
 def run_command(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "report":
+        return _run_report_command(args)
     config = PipelineConfig.load(args.config)
     artifacts = ArtifactStore(config.paths.runs_dir, config.paths.state_dir).create_run(args.run_id)
     manifest = RunManifest(artifacts.run_dir, artifacts.run_id, vars(args))
@@ -123,9 +162,9 @@ def run_command(argv: list[str] | None = None) -> int:
         elif args.command == "block":
             runner.block(Path(args.recommendations) if args.recommendations else None, apply=args.apply, manual_override_reason=args.manual_override_reason)
         elif args.command == "full":
-            runner.full(args.start, args.end, args.favorite_name, args.export_date, apply=args.apply)
+            runner.full(args.start, args.end, args.favorite_name, args.export_date, apply=args.apply, report=args.report)
         elif args.command == "scheduled":
-            runner.scheduled(args.job_name, apply=args.apply)
+            runner.scheduled(args.job_name, apply=args.apply, report=args.report)
         manifest.finish("completed")
         print("Status: completed", flush=True)
         print(f"Events: {events.path}", flush=True)
@@ -264,8 +303,11 @@ class PipelineRunner:
             raise RuntimeError(f"export-logs failed with exit code {result.returncode}")
         latest = find_latest_file(self.artifacts.exports_dir, "*.xlsx")
         self.manifest.set_output("exported_xlsx", str(latest))
-        self.manifest.finish_stage(stage, "completed", details={"xlsx": str(latest)})
-        self.events.emit(stage, "INFO", "stage_completed", "exported SIP logs", {"xlsx": str(latest)})
+        log_count = read_exported_log_count(self.artifacts.exports_dir)
+        if log_count is not None:
+            self.manifest.set_output("exported_log_count", log_count)
+        self.manifest.finish_stage(stage, "completed", details={"xlsx": str(latest), "log_count": log_count})
+        self.events.emit(stage, "INFO", "stage_completed", "exported SIP logs", {"xlsx": str(latest), "log_count": log_count})
         return latest
 
     def export_firewall_blacklist(self) -> Path:
@@ -372,7 +414,7 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "selected block targets", {"target_count": len(selection.targets), "apply": apply})
         return selection.targets
 
-    def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False) -> None:
+    def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False, report: bool = False) -> None:
         self.events.emit("full", "INFO", "stage_started", "starting full pipeline", {"start": start, "end": end, "apply": apply})
         self.check_sessions()
         xlsx = self.export_logs(start, end, favorite_name, export_date)
@@ -385,8 +427,10 @@ class PipelineRunner:
         self.manifest.set_output("daily_report_md", str(md_path))
         self.manifest.set_output("daily_report_json", str(json_path))
         self.events.emit("full", "INFO", "stage_completed", "full pipeline completed", {"report": str(md_path), "report_json": str(json_path)})
+        if report:
+            print_console_report(self.artifacts.run_dir)
 
-    def scheduled(self, job_name: str, *, apply: bool = False) -> None:
+    def scheduled(self, job_name: str, *, apply: bool = False, report: bool = False) -> None:
         stage = "scheduled"
         schedule = self.config.schedules.get(job_name)
         if schedule is None:
@@ -406,7 +450,7 @@ class PipelineRunner:
         }
         self.manifest.start_stage(stage, details)
         self.events.emit(stage, "INFO", "stage_started", "starting scheduled pipeline", details)
-        self.full(start, end, schedule.favorite_name, None, apply=effective_apply)
+        self.full(start, end, schedule.favorite_name, None, apply=effective_apply, report=report)
         self.manifest.finish_stage(stage, "completed", details=details)
         self.events.emit(stage, "INFO", "stage_completed", "scheduled pipeline completed", details)
 

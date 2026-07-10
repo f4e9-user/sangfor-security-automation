@@ -31,6 +31,17 @@ def read_csv(path: Path):
         return list(csv.DictReader(handle))
 
 
+class _DummyPaths:
+    def __init__(self, root: Path):
+        self.runs_dir = root / "runs"
+        self.state_dir = root / "state"
+
+
+class _DummyConfig:
+    def __init__(self, root: Path):
+        self.paths = _DummyPaths(root)
+
+
 def test_redaction_removes_headers_json_fields_and_cli_values():
     payload = (
         "Cookie: SESSID=abc; Set-Cookie: token=def\n"
@@ -534,7 +545,7 @@ def test_scheduled_apply_requires_config_allow_apply(tmp_path, monkeypatch):
     runner = PipelineRunner(config, artifacts, manifest, events)
     calls = []
 
-    def fake_full(start, end, favorite_name, export_date, *, apply=False):
+    def fake_full(start, end, favorite_name, export_date, *, apply=False, report=False):
         calls.append({"start": start, "end": end, "favorite_name": favorite_name, "apply": apply})
 
     monkeypatch.setattr(runner, "full", fake_full)
@@ -719,7 +730,11 @@ def test_daily_report_contains_blocked_skipped_evidence_and_no_secrets(tmp_path)
         "started_at": "2026-07-07T00:30:00+00:00",
         "ended_at": "2026-07-07T00:31:00+00:00",
         "stages": {"check-sessions": {"status": "completed"}},
-        "outputs": {"exported_xlsx": "report.xlsx", "firewall_blacklist": "blacklist.csv"},
+        "outputs": {
+            "exported_xlsx": "report.xlsx",
+            "firewall_blacklist": "blacklist.csv",
+            "exported_log_count": 6300,
+        },
         "target_count": 1,
         "apply": True,
     }
@@ -731,9 +746,119 @@ def test_daily_report_contains_blocked_skipped_evidence_and_no_secrets(tmp_path)
     assert "1.1.1.1" in markdown
     assert "2.2.2.2" in markdown
     assert "whitelisted" in markdown
+    assert "Analyzed logs: 6300" in markdown
+    assert payload["analyzed_log_count"] == 6300
     assert payload["blocked_ips"][0]["ip"] == "1.1.1.1"
     assert payload["skipped_ips"][0]["skip_reason"] == "whitelisted"
     combined = markdown + json.dumps(payload, ensure_ascii=False)
     assert "secret-cookie" not in combined
     assert "secret-token" not in combined
     assert "[REDACTED]" in combined
+
+
+def test_print_console_report_lists_blocked_only(tmp_path):
+    import io
+
+    from pipeline.reports import print_console_report
+
+    run_dir = tmp_path / "runs" / "20260710_172704"
+    (run_dir / "reports").mkdir(parents=True)
+    (run_dir / "analysis").mkdir(parents=True)
+    (run_dir / "exports").mkdir(parents=True)
+    normalized = run_dir / "analysis" / "blocklist_recommendations.normalized.csv"
+    normalized.write_text(
+        "ip,recommendation,final_score,base_score,history_score,attack_count,threat_types,severity,attack_chain,evidence_summary,sample_urls,historical_occurrences,recommendation_reasons,source_report,already_blacklisted,blocked_this_run,skip_reason\n"
+        "9.9.9.9,建议封禁,64.3,50,14,70,WebShell上传|代码注入,高危,WebShell投递 → 漏洞利用,通用XSS攻击,url,0,累计 70 次攻击,report.xlsx,false,true,\n"
+        "8.8.8.8,持续监控,40,30,10,4,扫描,高危,侦察,证据,url,0,观察中,report.xlsx,false,false,低分\n",
+        encoding="utf-8",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": "20260710_172704", "outputs": {"exported_log_count": 6300}}),
+        encoding="utf-8",
+    )
+    (run_dir / "reports" / "daily_report.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260710_172704",
+                "log_window": {"start": "2026-07-08 10:30:00", "end": "2026-07-10 17:30:00"},
+                "analyzed_log_count": 6300,
+                "candidate_ip_count": 2,
+                "blocked_count": 1,
+                "skipped_count": 1,
+                "blocked_ips": [
+                    {
+                        "ip": "9.9.9.9",
+                        "recommendation": "建议封禁",
+                        "final_score": "64.3",
+                        "attack_count": "70",
+                        "threat_types": "WebShell上传|代码注入",
+                        "attack_chain": "WebShell投递 → 漏洞利用",
+                        "evidence_summary": "通用XSS攻击",
+                        "recommendation_reasons": "累计 70 次攻击",
+                    }
+                ],
+                "skipped_ips": [{"ip": "8.8.8.8", "skip_reason": "低分"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf = io.StringIO()
+    count = print_console_report(run_dir, stream=buf)
+    out = buf.getvalue()
+
+    assert count == 1
+    assert "分析日志: 6300 条" in out
+    assert "实际封禁: 1" in out
+    assert "9.9.9.9" in out
+    assert "WebShell投递 → 漏洞利用" in out
+    # skipped IP is intentionally not shown in the console evidence chain
+    assert "8.8.8.8" not in out
+
+
+def test_print_console_report_backfills_count_from_export_manifest(tmp_path):
+    import io
+
+    from pipeline.reports import print_console_report
+
+    run_dir = tmp_path / "runs" / "20260710_172704"
+    (run_dir / "reports").mkdir(parents=True)
+    (run_dir / "analysis").mkdir(parents=True)
+    (run_dir / "exports").mkdir(parents=True)
+    # normalized CSV with one blocked row
+    (run_dir / "analysis" / "blocklist_recommendations.normalized.csv").write_text(
+        "ip,recommendation,final_score,base_score,history_score,attack_count,threat_types,severity,attack_chain,evidence_summary,sample_urls,historical_occurrences,recommendation_reasons,source_report,already_blacklisted,blocked_this_run,skip_reason\n"
+        "9.9.9.9,建议封禁,64.3,50,14,70,WebShell上传,高危,漏洞利用,证据,url,0,理由,report.xlsx,false,true,\n",
+        encoding="utf-8",
+    )
+    # stale daily_report.json predating analyzed_log_count
+    (run_dir / "reports" / "daily_report.json").write_text(
+        json.dumps({"run_id": "20260710_172704", "blocked_count": 1, "candidate_ip_count": 1, "blocked_ips": [{"ip": "9.9.9.9"}]}),
+        encoding="utf-8",
+    )
+    # export manifest supplies the count
+    (run_dir / "exports" / "manifest-20260708_103000-20260710_173000.json").write_text(
+        json.dumps({"total_count": 6300}),
+        encoding="utf-8",
+    )
+
+    buf = io.StringIO()
+    print_console_report(run_dir, stream=buf)
+    assert "分析日志: 6300 条" in buf.getvalue()
+
+
+def test_report_subcommand_does_not_create_run_and_uses_latest(tmp_path, monkeypatch):
+    from pipeline import run_pipeline as rp
+
+    calls = {}
+    monkeypatch.setattr(rp.PipelineConfig, "load", classmethod(lambda cls, *a, **k: _DummyConfig(tmp_path)))
+    monkeypatch.setattr(rp, "print_console_report", lambda run_dir, *a, **k: calls.setdefault("run_dir", run_dir))
+
+    (tmp_path / "runs" / "20260707_083000").mkdir(parents=True)
+
+    rc = rp.run_command(["report"])
+
+    assert rc == 0
+    assert calls["run_dir"] == tmp_path / "runs" / "20260707_083000"
+    # no new run directory should have been created by the read-only report command
+    assert not (tmp_path / "state" / "latest.json").exists()
