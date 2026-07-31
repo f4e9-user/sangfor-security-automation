@@ -8,6 +8,7 @@
 
 import base64
 import hashlib
+import math
 import re
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -21,13 +22,19 @@ from modules.output_paths import build_blocklist_output_path
 # ── 评分权重 ──────────────────────────────────────────────────────
 
 SCORE_WEIGHTS = {
-    "volume": 25,        # 攻击量
-    "diversity": 15,     # 攻击类型多样性
-    "severity": 25,      # 严重等级
-    "persistence": 15,   # 持续性
-    "attack_chain": 10,  # 攻击链阶段数
-    "payload_risk": 10,  # Payload 危险度
+    "volume": 20,
+    "diversity": 10,
+    "severity": 20,
+    "persistence": 10,
+    "attack_chain": 10,
+    "payload_risk": 15,
+    "behavior_confidence": 15,
 }
+
+HIGH_RISK_INTENT_PATTERNS = (
+    "命令执行", "代码执行", "远程代码执行", "rce", "code exec",
+    "webshell", "后门", "反序列化", "deserialize",
+)
 
 
 # ── HTTP 数据包解析 ────────────────────────────────────────────────
@@ -187,9 +194,12 @@ def _score_ip(
     details = {}
     score = 0
 
-    # 1. 攻击量 (0-25)
+    # 1. 攻击量：固定对数刻度，避免批次极端值扭曲其他 IP。
     attack_count = len(ip_data)
-    volume_score = round(attack_count / max(max_attacks, 1) * SCORE_WEIGHTS["volume"], 1)
+    volume_score = round(
+        min(math.log1p(attack_count) / math.log1p(1000), 1) * SCORE_WEIGHTS["volume"],
+        1,
+    )
     score += volume_score
     details["volume"] = {"score": volume_score, "attacks": attack_count}
 
@@ -212,7 +222,7 @@ def _score_ip(
         sev_dist = sevs.value_counts().to_dict()
         total = len(sevs)
         critical_count = sum(v for k, v in sev_dist.items()
-                           if any(w in k for w in ["高危", "严重", "critical", "高"]))
+                           if any(w in k.lower() for w in ["高危", "严重", "critical", "致命", "高"]))
         critical_ratio = critical_count / total if total > 0 else 0
         severity_score = round(critical_ratio * SCORE_WEIGHTS["severity"], 1)
         score += severity_score
@@ -310,11 +320,139 @@ def _score_ip(
             danger_reasons.append(f"已知攻击工具: {ua[:50]}")
             break
 
+    high_risk_intent = _detect_high_risk_intent(ip_data, cols, danger_reasons)
+    if high_risk_intent["detected"] and danger_score < 10:
+        danger_score = 10
+        danger_reasons.append("明确高危攻击意图")
     danger_score = min(danger_score, SCORE_WEIGHTS["payload_risk"])
     score += danger_score
     details["payload_risk"] = {"score": danger_score, "reasons": danger_reasons}
 
+    behavior = _score_behavior_confidence(ip_data, cols)
+    score += behavior["score"]
+    details["behavior_confidence"] = behavior
+    details["high_risk_intent"] = high_risk_intent
+
     return round(score, 1), details
+
+
+def _text_matches(value: str, pattern: str) -> bool:
+    value = str(value).strip().lower()
+    pattern = pattern.lower()
+    if pattern.isascii():
+        return re.search(rf"(?<![a-z0-9]){re.escape(pattern)}(?![a-z0-9])", value) is not None
+    return pattern in value
+
+
+def _rate_matching(
+    series: pd.Series,
+    patterns: Tuple[str, ...],
+    excluded: Tuple[str, ...] = (),
+) -> float:
+    values = series.fillna("").astype(str).str.strip().str.lower()
+    if values.empty:
+        return 0.0
+    return round(values.apply(
+        lambda value: (
+            any(_text_matches(value, pattern) for pattern in patterns)
+            and not any(_text_matches(value, pattern) for pattern in excluded)
+        )
+    ).mean(), 4)
+
+
+def _score_behavior_confidence(ip_data: pd.DataFrame, cols: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """Score evidence that malicious activity reached useful targets or responses."""
+    action_col = cols.get("action")
+    result_col = cols.get("attack_result")
+    status_col = cols.get("status_code")
+    dst_col = cols.get("dst_ip")
+
+    allowed_rate = blocked_rate = failed_rate = None
+    not_found_rate = effective_response_rate = status_coverage_rate = None
+    reasons = []
+    positive = 0.0
+    negative = 0.0
+
+    if action_col and action_col in ip_data.columns:
+        actions = ip_data[action_col]
+        allowed_rate = _rate_matching(
+            actions,
+            ("允许", "allow", "放行", "pass"),
+            ("不允许", "禁止", "disallow", "not allowed"),
+        )
+        blocked_rate = _rate_matching(actions, ("拒绝", "阻断", "deny", "block", "drop"))
+        positive += allowed_rate * 5
+        negative += blocked_rate * 0.35
+        if allowed_rate >= 0.5:
+            reasons.append(f"允许率 {allowed_rate:.0%}")
+        if blocked_rate >= 0.5:
+            reasons.append(f"拒绝率 {blocked_rate:.0%}")
+
+    if result_col and result_col in ip_data.columns:
+        results = ip_data[result_col]
+        failed_rate = _rate_matching(results, ("失败", "fail", "未遂"))
+        positive += _rate_matching(
+            results,
+            ("成功", "success", "succeed"),
+            ("不成功", "未成功", "unsuccessful", "not successful"),
+        ) * 3
+        negative += failed_rate * 0.25
+        if failed_rate >= 0.5:
+            reasons.append(f"失败率 {failed_rate:.0%}")
+
+    if status_col and status_col in ip_data.columns:
+        numeric = pd.to_numeric(ip_data[status_col], errors="coerce")
+        if numeric.notna().any():
+            denominator = max(len(ip_data), 1)
+            status_coverage_rate = round(numeric.notna().sum() / denominator, 4)
+            effective_response_rate = round(numeric.between(200, 399).sum() / denominator, 4)
+            not_found_rate = round((numeric == 404).sum() / denominator, 4)
+            positive += effective_response_rate * 4
+            negative += not_found_rate * 0.4
+            if effective_response_rate >= 0.3:
+                reasons.append(f"有效响应率 {effective_response_rate:.0%}")
+            if not_found_rate >= 0.5:
+                reasons.append(f"404率 {not_found_rate:.0%}")
+
+    target_count = 0
+    if dst_col and dst_col in ip_data.columns:
+        target_count = int(ip_data[dst_col].dropna().astype(str).nunique())
+        positive += min(target_count / 5, 1) * 3
+        if target_count >= 3:
+            reasons.append(f"攻击 {target_count} 个目标")
+
+    score = round(max(0.0, positive * max(0.2, 1 - min(negative, 0.8))), 1)
+    return {
+        "score": min(score, SCORE_WEIGHTS["behavior_confidence"]),
+        "allowed_rate": allowed_rate,
+        "blocked_rate": blocked_rate,
+        "failed_rate": failed_rate,
+        "not_found_rate": not_found_rate,
+        "effective_response_rate": effective_response_rate,
+        "status_coverage_rate": status_coverage_rate,
+        "target_count": target_count,
+        "reasons": reasons,
+    }
+
+
+def _detect_high_risk_intent(
+    ip_data: pd.DataFrame,
+    cols: Dict[str, Optional[str]],
+    payload_reasons: List[str],
+) -> Dict[str, Any]:
+    evidence = []
+    for key in ("threat_type", "description", "url"):
+        col = cols.get(key)
+        if not col or col not in ip_data.columns:
+            continue
+        text = " ".join(ip_data[col].dropna().astype(str).drop_duplicates()).lower()
+        for pattern in HIGH_RISK_INTENT_PATTERNS:
+            if _text_matches(text, pattern) and pattern not in evidence:
+                evidence.append(pattern)
+    for reason in payload_reasons:
+        if reason in {"命令执行尝试", "WebShell/上传探测"} and reason not in evidence:
+            evidence.append(reason)
+    return {"detected": bool(evidence), "evidence": evidence[:6]}
 
 
 # ── 历史对比 ────────────────────────────────────────────────────────
@@ -456,6 +594,12 @@ def _build_recommendation_reasons(item: Dict[str, Any]) -> List[str]:
     if stages:
         reasons.append(f"攻击链覆盖{'、'.join(stages[:3])}")
 
+    for reason in score_details.get("calibration", {}).get("reasons", []):
+        if reason and reason not in reasons:
+            reasons.append(reason)
+        if len(reasons) >= 4:
+            break
+
     for reason in score_details.get("payload_risk", {}).get("reasons", []):
         if reason and reason not in reasons:
             reasons.append(reason)
@@ -468,6 +612,68 @@ def _build_recommendation_reasons(item: Dict[str, Any]) -> List[str]:
             break
 
     return reasons[:4]
+
+
+def _classify_recommendation(
+    attack_count: int,
+    base_score: float,
+    final_score: float,
+    score_details: Dict[str, Any],
+) -> Tuple[str, str, List[str]]:
+    """Classify an IP using score plus explicit evidence gates."""
+    behavior = score_details.get("behavior_confidence", {})
+    stages = score_details.get("attack_chain", {}).get("stages") or []
+    high_risk = bool(score_details.get("high_risk_intent", {}).get("detected"))
+    payload_score = score_details.get("payload_risk", {}).get("score", 0)
+    history = score_details.get("history", {})
+
+    allowed_rate = behavior.get("allowed_rate") or 0
+    effective_rate = behavior.get("effective_response_rate") or 0
+    target_count = behavior.get("target_count") or 0
+    failed_rate = behavior.get("failed_rate") or 0
+    not_found_rate = behavior.get("not_found_rate") or 0
+    previous_recommendations = history.get("previous_recommendation_count") or 0
+
+    positive_execution = allowed_rate >= 0.3 and effective_rate >= 0.2
+    low_outcome_confidence = failed_rate >= 0.8 or not_found_rate >= 0.8
+    strong_chain = len(stages) >= 3 and not low_outcome_confidence
+    repeated_high_risk = high_risk and payload_score >= 10 and previous_recommendations > 0
+    if final_score >= 70 and high_risk and (
+        positive_execution or strong_chain or repeated_high_risk
+    ):
+        reasons = ["高危意图叠加有效放行响应"] if positive_execution else ["高危多阶段或历史重复攻击"]
+        return "立即封禁", "🔴", reasons
+
+    high_volume_scan = attack_count >= 200 and (
+        "侦察" in stages or failed_rate >= 0.5 or not_found_rate >= 0.5
+    )
+    multi_target_persistent = (
+        target_count >= 3
+        and score_details.get("persistence", {}).get("span_hours", 0) >= 1
+        and base_score >= 25
+    )
+    supported_current_risk = high_risk and base_score >= 25
+    historical_support = (
+        base_score >= 25
+        and final_score >= 40
+        and previous_recommendations > 0
+        and (high_risk or any(stage != "侦察" for stage in stages))
+    )
+    if high_volume_scan or multi_target_persistent or supported_current_risk or historical_support:
+        reasons = []
+        if high_volume_scan:
+            reasons.append(f"高频恶意扫描 {attack_count} 次")
+        if supported_current_risk:
+            reasons.append("检测到明确高危攻击意图")
+        if multi_target_persistent:
+            reasons.append(f"持续攻击 {target_count} 个目标")
+        if historical_support:
+            reasons.append("当前风险得到历史重复记录支撑")
+        return "建议封禁", "🟠", reasons
+
+    if final_score >= 25:
+        return "持续监控", "🟡", []
+    return "观察", "⚪", []
 
 
 # ── 主引擎 ─────────────────────────────────────────────────────────
@@ -576,32 +782,11 @@ class BlocklistAdvisor:
 
         blocklist = []
         for item in self.score_all_ips(min_attacks=min_attacks):
-            base_score = item.get("base_score", item.get("score", 0))
             final_score = item.get("final_score", item.get("score", 0))
-            score_details = item.get("score_details", {})
-            severity_score = score_details.get("severity", {}).get("score", 0)
-            payload_score = score_details.get("payload_risk", {}).get("score", 0)
-            chain_stages = score_details.get("attack_chain", {}).get("stages") or []
-            substantive_current_risk = (
-                severity_score > 0
-                or payload_score > 0
-                or any(stage != "侦察" for stage in chain_stages)
-            )
-            meets_final_threshold = final_score >= final_threshold
-            high_current_risk = (
-                base_score >= self.RECOMMEND_HIGH_BASE_SCORE
-                and meets_final_threshold
-                and substantive_current_risk
-            )
-            supported_by_current_risk = (
-                base_score >= self.RECOMMEND_MIN_BASE_SCORE
-                and meets_final_threshold
-                and substantive_current_risk
-            )
-
-            if not (high_current_risk or supported_by_current_risk):
+            if final_score < final_threshold:
                 continue
-
+            if item.get("recommendation") not in ("立即封禁", "建议封禁"):
+                continue
             blocklist.append(dict(item, is_recommended=True))
 
         blocklist.sort(key=lambda x: -x["score"])
@@ -646,18 +831,10 @@ class BlocklistAdvisor:
 
             score_details["history"] = history_details
 
-            if final_score >= 70:
-                recommendation = "立即封禁"
-                label = "🔴"
-            elif final_score >= 45:
-                recommendation = "建议封禁"
-                label = "🟠"
-            elif final_score >= 25:
-                recommendation = "持续监控"
-                label = "🟡"
-            else:
-                recommendation = "观察"
-                label = "⚪"
+            recommendation, label, calibration_reasons = _classify_recommendation(
+                count, base_score, final_score, score_details
+            )
+            score_details["calibration"] = {"reasons": calibration_reasons}
 
             item = {
                 "ip": ip,
@@ -846,6 +1023,15 @@ class BlocklistAdvisor:
                 "first_seen": hist.get("first_seen", ""),
                 "last_seen": hist.get("last_seen", hist_details.get("last_seen", "")),
                 "recommendation_reasons": "|".join(b.get("recommendation_reasons", [])),
+                "behavior_confidence_score": sd.get("behavior_confidence", {}).get("score", ""),
+                "allowed_rate": sd.get("behavior_confidence", {}).get("allowed_rate", ""),
+                "blocked_rate": sd.get("behavior_confidence", {}).get("blocked_rate", ""),
+                "failed_rate": sd.get("behavior_confidence", {}).get("failed_rate", ""),
+                "not_found_rate": sd.get("behavior_confidence", {}).get("not_found_rate", ""),
+                "effective_response_rate": sd.get("behavior_confidence", {}).get("effective_response_rate", ""),
+                "target_count": sd.get("behavior_confidence", {}).get("target_count", ""),
+                "high_risk_intent": sd.get("high_risk_intent", {}).get("detected", False),
+                "calibration_reasons": "|".join(sd.get("calibration", {}).get("reasons", [])),
             })
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)

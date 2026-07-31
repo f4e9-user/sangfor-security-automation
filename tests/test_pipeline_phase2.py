@@ -205,8 +205,8 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
     source_report = tmp_path / "sangfor-sip-report-KsearchLog-2026070701.xlsx"
     raw_csv = tmp_path / "raw.csv"
     raw_csv.write_text(
-        "IP,建议,评分,final_score,base_score,history_score,攻击次数,威胁类型,主要威胁,最高严重等级,攻击链,Payload风险,证据摘要,样本描述,样本URL,历史出现次数,推荐理由,already_blacklisted\n"
-        "1.1.1.1,立即封禁,88,91,70,21,42,SQL注入|扫描,信息泄露|网站扫描,高,侦察>利用,源码/备份文件探测,证据,检测到网站攻击！攻击类型：信息泄漏攻击,https://example.test/a,3,高频攻击|历史复现,false\n",
+        "IP,建议,评分,final_score,base_score,history_score,攻击次数,威胁类型,主要威胁,最高严重等级,攻击链,Payload风险,证据摘要,样本描述,样本URL,历史出现次数,推荐理由,behavior_confidence_score,allowed_rate,blocked_rate,failed_rate,not_found_rate,effective_response_rate,target_count,high_risk_intent,calibration_reasons,already_blacklisted\n"
+        "1.1.1.1,立即封禁,88,91,70,21,42,SQL注入|扫描,信息泄露|网站扫描,高,侦察>利用,源码/备份文件探测,证据,检测到网站攻击！攻击类型：信息泄漏攻击,https://example.test/a,3,高频攻击|历史复现,12.5,0.8,0.2,0.1,0.05,0.7,4,true,高危意图叠加有效放行响应,false\n",
         encoding="utf-8",
     )
     normalized = tmp_path / "blocklist_recommendations.normalized.csv"
@@ -223,6 +223,11 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
     assert "检测到网站攻击" in rows[0]["evidence_summary"]
     assert "源码/备份文件探测" in rows[0]["evidence_summary"]
     assert rows[0]["sample_urls"] == "https://example.test/a"
+    assert rows[0]["behavior_confidence_score"] == "12.5"
+    assert rows[0]["allowed_rate"] == "0.8"
+    assert rows[0]["target_count"] == "4"
+    assert rows[0]["high_risk_intent"] == "true"
+    assert "高危意图" in rows[0]["calibration_reasons"]
     assert rows[0]["blocked_this_run"] == "false"
     assert rows[0]["skip_reason"] == ""
 

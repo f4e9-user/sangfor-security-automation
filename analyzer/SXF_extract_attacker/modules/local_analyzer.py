@@ -36,6 +36,7 @@ _COLUMN_CANDIDATES = {
     "status_code": ["状态码", "Status Code", "status_code", "HTTP状态码"],
     "data_source": ["数据来源", "Data Source", "source", "来源"],
     "attack_result": ["攻击结果", "Attack Result", "result", "结果", "处理结果", "动作结果"],
+    "action": ["动作", "Action", "action", "处置动作", "防护动作"],
     "hit_whitelist": ["命中白名单", "Hit Whitelist", "whitelist", "白名单", "is_whitelist"],
     "xff": ["X-Forwarded-For", "XFF", "xff", "x_forwarded_for"],
 }
