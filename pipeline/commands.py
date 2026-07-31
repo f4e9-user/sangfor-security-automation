@@ -5,9 +5,12 @@ import json
 import shutil
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+import pandas as pd
 
 from .redaction import redact_secrets
 
@@ -242,6 +245,70 @@ def rewrite_normalized_with_selection(selection: BlockSelection, output_csv: str
     out_path = Path(output_csv)
     _write_normalized(out_path, selection.rows)
     return out_path
+
+
+def prepare_analysis_input(exports_dir: str | Path) -> Path:
+    """Return one XLSX containing every segment from the latest export manifest."""
+    exports_path = Path(exports_dir)
+    manifests = sorted(exports_path.glob("manifest-*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not manifests:
+        return find_latest_file(exports_path, "*.xlsx")
+
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    segments = manifest.get("segments") or []
+    if not segments:
+        raise ValueError(f"export manifest has no segments: {manifests[0]}")
+
+    sources = [exports_path / str(segment["file_name"]) for segment in segments]
+    missing = [str(path) for path in sources if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"export segment files missing: {', '.join(missing)}")
+
+    tolerate_count_drift = "split_limit" in manifest
+    if len(sources) == 1 and not tolerate_count_drift:
+        return sources[0]
+    export_limit = int(manifest.get("limit", 0))
+
+    frames = []
+    expected_columns = None
+    for source, segment in zip(sources, segments):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Workbook contains no default style")
+            frame = pd.read_excel(source, engine="openpyxl", skiprows=7)
+        declared_count = int(segment.get("count", len(frame)))
+        actual_count = len(frame)
+        if tolerate_count_drift:
+            if export_limit and actual_count >= export_limit:
+                raise ValueError(
+                    f"export segment reached export limit for {source.name}: "
+                    f"limit {export_limit}, got {actual_count}; segment may be truncated"
+                )
+            segment["actual_count"] = actual_count
+        elif actual_count != declared_count:
+            raise ValueError(f"export segment row count mismatch for {source.name}: expected {declared_count}, got {actual_count}")
+        columns = list(frame.columns)
+        if expected_columns is None:
+            expected_columns = columns
+        elif columns != expected_columns:
+            raise ValueError(f"export segment columns mismatch: {source.name}")
+        frames.append(frame)
+
+    combined = pd.concat(frames, ignore_index=True)
+    if tolerate_count_drift:
+        manifest["actual_total_count"] = len(combined)
+        manifests[0].write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        expected_total = int(manifest.get("segment_total_count", manifest.get("total_count", len(combined))))
+        if len(combined) != expected_total:
+            raise ValueError(f"combined export row count mismatch: expected {expected_total}, got {len(combined)}")
+
+    if len(sources) == 1:
+        return sources[0]
+
+    date_token = sources[0].stem.rsplit("-", 1)[-1][:8]
+    output = exports_path / f"sangfor-sip-report-KsearchLog-{date_token}99.xlsx"
+    combined.to_excel(output, index=False, startrow=7)
+    return output
 
 
 def find_latest_file(directory: str | Path, pattern: str) -> Path:

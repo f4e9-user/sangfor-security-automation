@@ -7,7 +7,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sangfor_log_export import (
     Segment,
+    adaptive_export_segments,
     build_output_name,
+    effective_split_limit,
     build_payload,
     load_session_file,
     parse_cookie_header,
@@ -16,6 +18,69 @@ from sangfor_log_export import (
     split_segments,
     timestamp,
 )
+
+
+def test_effective_split_limit_reserves_headroom_for_sip_count_drift():
+    assert effective_split_limit(10000) == 9500
+    assert effective_split_limit(100) == 95
+    assert effective_split_limit(1) == 1
+
+
+def test_adaptive_export_splits_again_when_download_reaches_hard_limit(tmp_path):
+    start = datetime(2026, 7, 24, 17, 0)
+    end = datetime(2026, 7, 31, 16, 0)
+    attempted = []
+
+    def export_candidate(segment, output_path):
+        attempted.append(segment)
+        output_path.write_bytes(b"candidate")
+        return f"server-{len(attempted)}"
+
+    def row_counter(path):
+        # The initial SIP estimate is 9,945, but the downloaded workbook hits 10,000.
+        return 10000 if len(attempted) == 1 else 5200
+
+    exported = adaptive_export_segments(
+        [Segment(start, end, 9945)],
+        export_candidate=export_candidate,
+        row_counter=row_counter,
+        output_dir=tmp_path,
+        export_date="2026-07-31",
+        export_limit=10000,
+    )
+
+    assert len(attempted) == 3
+    assert len(exported) == 2
+    assert [item["actual_count"] for item in exported] == [5200, 5200]
+    assert [item["file_name"] for item in exported] == [
+        "sangfor-sip-report-KsearchLog-2026073101.xlsx",
+        "sangfor-sip-report-KsearchLog-2026073102.xlsx",
+    ]
+    assert not (tmp_path / ".sangfor-export-candidate.xlsx").exists()
+    assert all((tmp_path / item["file_name"]).is_file() for item in exported)
+    assert exported[0]["end"] < exported[1]["start"]
+
+
+def test_adaptive_export_rejects_unsplittable_interval_at_hard_limit(tmp_path):
+    instant = datetime(2026, 7, 31, 16, 0)
+
+    def export_candidate(segment, output_path):
+        output_path.write_bytes(b"candidate")
+        return "server-file"
+
+    try:
+        adaptive_export_segments(
+            [Segment(instant, instant, 10000)],
+            export_candidate=export_candidate,
+            row_counter=lambda path: 10000,
+            output_dir=tmp_path,
+            export_date="2026-07-31",
+            export_limit=10000,
+        )
+    except ValueError as exc:
+        assert "cannot split further" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_parse_cookie_header_splits_cookie_pairs():

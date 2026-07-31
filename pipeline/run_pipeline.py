@@ -19,8 +19,8 @@ from .commands import (
     copy_analyzer_output,
     export_firewall_blacklist_command,
     export_logs_command,
-    find_latest_file,
     normalize_recommendations,
+    prepare_analysis_input,
     rewrite_normalized_with_selection,
     run_subprocess,
     select_block_targets,
@@ -82,12 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--favorite-name", default=None)
     full.add_argument("--export-date", default=None)
     full.add_argument("--apply", action="store_true")
-    full.add_argument("--report", action="store_true", help="print a console summary after completion")
+    full.add_argument("--report", action=argparse.BooleanOptionalAction, default=True, help="print a console summary after completion (default: enabled)")
 
     scheduled = subparsers.add_parser("scheduled")
     scheduled.add_argument("job_name")
     scheduled.add_argument("--apply", action="store_true")
-    scheduled.add_argument("--report", action="store_true", help="print a console summary after completion")
+    scheduled.add_argument("--report", action=argparse.BooleanOptionalAction, default=True, help="print a console summary after completion (default: enabled)")
 
     report = subparsers.add_parser("report", help="print a console summary for the latest or a given run (read-only)")
     report.add_argument("--run-id", default=None, help="run id to summarize; defaults to the latest run")
@@ -301,14 +301,16 @@ class PipelineRunner:
             self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
             self.events.emit(stage, "ERROR", "stage_failed", "export SIP logs failed", {"returncode": result.returncode})
             raise RuntimeError(f"export-logs failed with exit code {result.returncode}")
-        latest = find_latest_file(self.artifacts.exports_dir, "*.xlsx")
-        self.manifest.set_output("exported_xlsx", str(latest))
+        analysis_input = prepare_analysis_input(self.artifacts.exports_dir)
+        self.manifest.set_output("exported_xlsx", str(analysis_input))
+        self.manifest.set_output("analysis_input_xlsx", str(analysis_input))
         log_count = read_exported_log_count(self.artifacts.exports_dir)
         if log_count is not None:
             self.manifest.set_output("exported_log_count", log_count)
-        self.manifest.finish_stage(stage, "completed", details={"xlsx": str(latest), "log_count": log_count})
-        self.events.emit(stage, "INFO", "stage_completed", "exported SIP logs", {"xlsx": str(latest), "log_count": log_count})
-        return latest
+        details = {"xlsx": str(analysis_input), "log_count": log_count}
+        self.manifest.finish_stage(stage, "completed", details=details)
+        self.events.emit(stage, "INFO", "stage_completed", "exported SIP logs", details)
+        return analysis_input
 
     def export_firewall_blacklist(self) -> Path:
         stage = "export-firewall-blacklist"
@@ -332,7 +334,7 @@ class PipelineRunner:
 
     def analyze(self, xlsx: Path | None = None, blacklist: Path | None = None, *, persist_history: bool = False) -> Path:
         stage = "analyze"
-        xlsx = xlsx or find_latest_file(self.artifacts.exports_dir, "*.xlsx")
+        xlsx = xlsx or prepare_analysis_input(self.artifacts.exports_dir)
         blacklist = blacklist or self.artifacts.blacklist_dir / "sangfor_firewall_blacklists.csv"
         self.manifest.start_stage(stage, {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
         self.events.emit(stage, "INFO", "stage_started", "running attacker analysis", {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
@@ -417,7 +419,7 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "selected block targets", {"target_count": len(selection.targets), "apply": apply})
         return selection.targets
 
-    def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False, report: bool = False) -> None:
+    def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False, report: bool = True) -> None:
         self.events.emit("full", "INFO", "stage_started", "starting full pipeline", {"start": start, "end": end, "apply": apply})
         self.check_sessions()
         xlsx = self.export_logs(start, end, favorite_name, export_date)
@@ -433,7 +435,7 @@ class PipelineRunner:
         if report:
             print_console_report(self.artifacts.run_dir)
 
-    def scheduled(self, job_name: str, *, apply: bool = False, report: bool = False) -> None:
+    def scheduled(self, job_name: str, *, apply: bool = False, report: bool = True) -> None:
         stage = "scheduled"
         schedule = self.config.schedules.get(job_name)
         if schedule is None:

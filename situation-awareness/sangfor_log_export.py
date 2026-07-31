@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlencode, urlparse
 
+from openpyxl import load_workbook
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 DEFAULT_BASE_URL = "https://sip.local"
@@ -200,6 +201,83 @@ def split_segments(
     return segments
 
 
+def effective_split_limit(export_limit: int) -> int:
+    """Leave headroom for SIP's eventually consistent total-count endpoint."""
+    if export_limit <= 0:
+        raise ValueError("export limit must be positive")
+    return max(1, int(export_limit * 0.95))
+
+
+def count_export_rows(path: str | Path) -> int:
+    """Count non-empty data rows below SIP's seven preamble rows and header."""
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        return sum(1 for row in sheet.iter_rows(min_row=9, values_only=True) if any(value is not None for value in row))
+    finally:
+        workbook.close()
+
+
+def adaptive_export_segments(
+    segments: Iterable[Segment],
+    *,
+    export_candidate: Callable[[Segment, Path], str],
+    row_counter: Callable[[Path], int],
+    output_dir: Path,
+    export_date: str | date,
+    export_limit: int,
+    overwrite: bool = False,
+) -> list[dict]:
+    """Export segments, recursively splitting any downloaded workbook that hits the hard limit."""
+    pending = list(segments)
+    exported: list[dict] = []
+    candidate_path = output_dir / ".sangfor-export-candidate.xlsx"
+
+    try:
+        while pending:
+            segment = pending.pop(0)
+            candidate_path.unlink(missing_ok=True)
+            server_file = export_candidate(segment, candidate_path)
+            actual_count = row_counter(candidate_path)
+
+            if actual_count >= export_limit:
+                candidate_path.unlink(missing_ok=True)
+                duration_seconds = int((segment.end - segment.start).total_seconds())
+                if duration_seconds < 1:
+                    raise ValueError(
+                        f"export segment reached export limit and cannot split further: "
+                        f"{segment.start:%Y-%m-%d %H:%M:%S} -> {segment.end:%Y-%m-%d %H:%M:%S}"
+                    )
+                midpoint = segment.start + timedelta(seconds=duration_seconds // 2)
+                pending[0:0] = [
+                    Segment(segment.start, midpoint, 0),
+                    Segment(midpoint + timedelta(seconds=1), segment.end, 0),
+                ]
+                print(
+                    f"RETRY split {segment.start:%Y-%m-%d %H:%M:%S} -> "
+                    f"{segment.end:%Y-%m-%d %H:%M:%S}: downloaded {actual_count} rows",
+                    flush=True,
+                )
+                continue
+
+            file_name = build_output_name(export_date, len(exported) + 1)
+            output_path = output_dir / file_name
+            if output_path.exists() and not overwrite:
+                candidate_path.unlink(missing_ok=True)
+                raise FileExistsError(f"refusing to overwrite {output_path}; pass --overwrite")
+            candidate_path.replace(output_path)
+            accepted = Segment(segment.start, segment.end, actual_count)
+            exported.append(
+                accepted.to_manifest(file_name=file_name)
+                | {"actual_count": actual_count, "server_file": server_file}
+            )
+            print(f"EXPORTED {file_name}: {actual_count}", flush=True)
+    finally:
+        candidate_path.unlink(missing_ok=True)
+
+    return exported
+
+
 class SangforExporter:
     def __init__(self, page: Page, base_url: str, xid: str):
         self.page = page
@@ -345,20 +423,22 @@ def export_logs(args: argparse.Namespace) -> dict:
                     return count
                 return counter(a, b)
 
-            segments = split_segments(start, end, cached_counter, limit=args.limit)
-            segment_total_count = sum(segment.count for segment in segments)
+            split_limit = effective_split_limit(args.limit)
+            segments = split_segments(start, end, cached_counter, limit=split_limit)
             manifest_segments = []
             if not args.dry_run:
-                for index, segment in enumerate(segments, start=1):
-                    file_name = build_output_name(args.export_date, index)
-                    output_path = output_dir / file_name
-                    if output_path.exists() and not args.overwrite:
-                        raise FileExistsError(f"refusing to overwrite {output_path}; pass --overwrite")
-                    server_file = exporter.export_segment(favorite, segment, output_path)
-                    manifest_segments.append(segment.to_manifest(file_name=file_name) | {"server_file": server_file})
-                    print(f"EXPORTED {file_name}: {segment.count}", flush=True)
+                manifest_segments = adaptive_export_segments(
+                    segments,
+                    export_candidate=lambda segment, path: exporter.export_segment(favorite, segment, path),
+                    row_counter=count_export_rows,
+                    output_dir=output_dir,
+                    export_date=args.export_date,
+                    export_limit=args.limit,
+                    overwrite=args.overwrite,
+                )
             else:
                 manifest_segments = [segment.to_manifest() for segment in segments]
+            segment_total_count = sum(int(segment["count"]) for segment in manifest_segments)
 
             manifest = {
                 "base_url": base_url,
@@ -367,9 +447,10 @@ def export_logs(args: argparse.Namespace) -> dict:
                 "requested_start": start.strftime(DATETIME_FORMAT),
                 "requested_end": end.strftime(DATETIME_FORMAT),
                 "limit": args.limit,
+                "split_limit": split_limit,
                 "total_count": total_count,
                 "segment_total_count": segment_total_count,
-                "segment_count": len(segments),
+                "segment_count": len(manifest_segments),
                 "export_date": args.export_date,
                 "output_dir": str(output_dir),
                 "dry_run": args.dry_run,

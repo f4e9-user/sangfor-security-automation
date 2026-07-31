@@ -227,6 +227,116 @@ def test_normalize_recommendations_writes_standard_schema(tmp_path):
     assert rows[0]["skip_reason"] == ""
 
 
+def test_prepare_analysis_input_merges_all_manifest_segments(tmp_path):
+    import pandas as pd
+
+    from pipeline.commands import prepare_analysis_input
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    columns = ["序号", "时间", "攻击类型", "源IP"]
+    first = exports / "sangfor-sip-report-KsearchLog-2026071701.xlsx"
+    second = exports / "sangfor-sip-report-KsearchLog-2026071702.xlsx"
+    pd.DataFrame([[1, "2026-07-16 10:00:00", "扫描", "1.1.1.1"], [2, "2026-07-16 10:01:00", "注入", "2.2.2.2"]], columns=columns).to_excel(first, index=False, startrow=7)
+    pd.DataFrame([[3, "2026-07-17 10:00:00", "扫描", "3.3.3.3"]], columns=columns).to_excel(second, index=False, startrow=7)
+    (exports / "manifest-20260717.json").write_text(
+        json.dumps({
+            "total_count": 3,
+            "segments": [
+                {"file_name": first.name, "count": 2},
+                {"file_name": second.name, "count": 1},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    merged = prepare_analysis_input(exports)
+
+    assert merged.name == "sangfor-sip-report-KsearchLog-2026071799.xlsx"
+    rows = pd.read_excel(merged, engine="openpyxl", skiprows=7)
+    assert len(rows) == 3
+    assert rows["源IP"].tolist() == ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+    assert list(rows.columns) == columns
+
+
+def test_prepare_analysis_input_accepts_count_drift_below_export_limit(tmp_path):
+    import pandas as pd
+
+    from pipeline.commands import prepare_analysis_input
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    columns = ["序号", "源IP"]
+    first = exports / "sangfor-sip-report-KsearchLog-2026071701.xlsx"
+    second = exports / "sangfor-sip-report-KsearchLog-2026071702.xlsx"
+    pd.DataFrame([[index, f"192.0.2.{index}"] for index in range(1, 10)], columns=columns).to_excel(first, index=False, startrow=7)
+    pd.DataFrame([[10, "192.0.2.10"], [11, "192.0.2.11"]], columns=columns).to_excel(second, index=False, startrow=7)
+    (exports / "manifest-20260717.json").write_text(
+        json.dumps({
+            "limit": 10,
+            "split_limit": 8,
+            "total_count": 10,
+            "segment_total_count": 10,
+            "segments": [
+                {"file_name": first.name, "count": 8},
+                {"file_name": second.name, "count": 2},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    merged = prepare_analysis_input(exports)
+
+    rows = pd.read_excel(merged, engine="openpyxl", skiprows=7)
+    assert len(rows) == 11
+
+
+def test_prepare_analysis_input_rejects_segment_at_export_limit(tmp_path):
+    import pandas as pd
+    import pytest
+
+    from pipeline.commands import prepare_analysis_input
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    columns = ["序号", "源IP"]
+    first = exports / "sangfor-sip-report-KsearchLog-2026071701.xlsx"
+    second = exports / "sangfor-sip-report-KsearchLog-2026071702.xlsx"
+    pd.DataFrame([[index, f"192.0.2.{index}"] for index in range(1, 11)], columns=columns).to_excel(first, index=False, startrow=7)
+    pd.DataFrame([[11, "192.0.2.11"]], columns=columns).to_excel(second, index=False, startrow=7)
+    (exports / "manifest-20260717.json").write_text(
+        json.dumps({
+            "limit": 10,
+            "split_limit": 8,
+            "total_count": 9,
+            "segment_total_count": 9,
+            "segments": [
+                {"file_name": first.name, "count": 8},
+                {"file_name": second.name, "count": 1},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reached export limit"):
+        prepare_analysis_input(exports)
+
+
+def test_prepare_analysis_input_reuses_single_manifest_segment(tmp_path):
+    from pipeline.commands import prepare_analysis_input
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    source = exports / "sangfor-sip-report-KsearchLog-2026071701.xlsx"
+    source.write_bytes(b"xlsx-placeholder")
+    (exports / "manifest-20260717.json").write_text(
+        json.dumps({"total_count": 1, "segments": [{"file_name": source.name, "count": 1}]}),
+        encoding="utf-8",
+    )
+
+    assert prepare_analysis_input(exports) == source
+
+
 def test_analyze_command_can_disable_or_enable_history_persistence(tmp_path):
     whitelist = tmp_path / "ip_whitelist.txt"
     command, cwd = analyze_command(
@@ -905,7 +1015,7 @@ def test_daily_report_contains_blocked_skipped_evidence_and_no_secrets(tmp_path)
     assert "[REDACTED]" in combined
 
 
-def test_print_console_report_lists_blocked_only(tmp_path):
+def test_print_console_report_lists_recommendations_and_actual_blocks(tmp_path):
     import io
 
     from pipeline.reports import print_console_report
@@ -932,6 +1042,7 @@ def test_print_console_report_lists_blocked_only(tmp_path):
                 "log_window": {"start": "2026-07-08 10:30:00", "end": "2026-07-10 17:30:00"},
                 "analyzed_log_count": 6300,
                 "candidate_ip_count": 2,
+                "recommended_count": 1,
                 "blocked_count": 1,
                 "skipped_count": 1,
                 "blocked_ips": [
@@ -946,6 +1057,19 @@ def test_print_console_report_lists_blocked_only(tmp_path):
                         "recommendation_reasons": "累计 70 次攻击",
                     }
                 ],
+                "recommended_ips": [
+                    {
+                        "ip": "9.9.9.9",
+                        "recommendation": "建议封禁",
+                        "final_score": "64.3",
+                        "attack_count": "70",
+                        "threat_types": "WebShell上传|代码注入",
+                        "attack_chain": "WebShell投递 → 漏洞利用",
+                        "evidence_summary": "通用XSS攻击",
+                        "recommendation_reasons": "累计 70 次攻击",
+                        "blocked_this_run": "true",
+                    }
+                ],
                 "skipped_ips": [{"ip": "8.8.8.8", "skip_reason": "低分"}],
             }
         ),
@@ -958,11 +1082,34 @@ def test_print_console_report_lists_blocked_only(tmp_path):
 
     assert count == 1
     assert "分析日志: 6300 条" in out
+    assert "建议封禁: 1" in out
     assert "实际封禁: 1" in out
+    assert "建议封禁 IP 证据链:" in out
+    assert "执行状态: 本次已封禁" in out
     assert "9.9.9.9" in out
     assert "WebShell投递 → 漏洞利用" in out
     # skipped IP is intentionally not shown in the console evidence chain
     assert "8.8.8.8" not in out
+
+
+def test_full_prints_console_report_by_default(tmp_path, monkeypatch):
+    config = PipelineConfig.from_dict({}, root_dir=tmp_path)
+    artifacts = ArtifactStore(tmp_path / "runs", tmp_path / "state").create_run("20260717_173927")
+    runner = PipelineRunner(config, artifacts, RunManifest(artifacts.run_dir, artifacts.run_id, {}), EventLogger(artifacts.run_dir, artifacts.run_id))
+    recommendations = artifacts.analysis_dir / "blocklist_recommendations.normalized.csv"
+    printed = []
+
+    monkeypatch.setattr(runner, "check_sessions", lambda: None)
+    monkeypatch.setattr(runner, "export_logs", lambda *args: tmp_path / "logs.xlsx")
+    monkeypatch.setattr(runner, "export_firewall_blacklist", lambda: tmp_path / "blacklist.csv")
+    monkeypatch.setattr(runner, "analyze", lambda *args, **kwargs: recommendations)
+    monkeypatch.setattr(runner, "block", lambda *args, **kwargs: ["9.9.9.9"])
+    monkeypatch.setattr("pipeline.run_pipeline.write_daily_report", lambda *args, **kwargs: (tmp_path / "report.md", tmp_path / "report.json"))
+    monkeypatch.setattr("pipeline.run_pipeline.print_console_report", lambda run_dir: printed.append(run_dir))
+
+    runner.full("2026-07-10 17:30:00", "2026-07-17 17:30:00", None, None)
+
+    assert printed == [artifacts.run_dir]
 
 
 def test_print_console_report_backfills_count_from_export_manifest(tmp_path):

@@ -22,6 +22,7 @@ def write_daily_report(
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     rows = _read_rows(normalized_csv)
+    recommended = _recommended_rows(rows)
     blocked = [row for row in rows if _truthy(row.get("blocked_this_run", ""))]
     skipped = [row for row in rows if row.get("skip_reason")]
     stats = _load_stats(run_path)
@@ -43,8 +44,10 @@ def write_daily_report(
             "temporal_patterns": stats.get("temporal_patterns"),
             "attack_chains": stats.get("attack_chains") or [],
             "candidate_ip_count": len(rows),
+            "recommended_count": len(recommended),
             "blocked_count": len(blocked),
             "skipped_count": len(skipped),
+            "recommended_ips": [_evidence(row) for row in recommended],
             "blocked_ips": [_evidence(row) for row in blocked],
             "skipped_ips": [_skip(row) for row in skipped],
         }
@@ -86,7 +89,14 @@ def _evidence(row: dict[str, str]) -> dict[str, str]:
         "historical_occurrences": row.get("historical_occurrences", ""),
         "recommendation_reasons": row.get("recommendation_reasons", ""),
         "source_report": row.get("source_report", ""),
+        "already_blacklisted": row.get("already_blacklisted", ""),
+        "blocked_this_run": row.get("blocked_this_run", ""),
+        "skip_reason": row.get("skip_reason", ""),
     }
+
+
+def _recommended_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [row for row in rows if row.get("recommendation") in {"立即封禁", "建议封禁"}]
 
 
 def _skip(row: dict[str, str]) -> dict[str, str]:
@@ -184,7 +194,7 @@ def read_exported_log_count(exports_dir: str | Path) -> int | None:
         return None
     try:
         data = json.loads(candidates[-1].read_text(encoding="utf-8"))
-        total = data.get("total_count")
+        total = data.get("actual_total_count", data.get("total_count"))
         return int(total) if total is not None else None
     except (OSError, ValueError, TypeError):
         return None
@@ -299,6 +309,7 @@ def print_console_report(run_dir: str | Path, *, stream: TextIO = sys.stdout) ->
     """
     run_path = Path(run_dir)
     payload = _load_report_payload(run_path)
+    recommended_ips = payload.get("recommended_ips", []) or []
     blocked_ips = payload.get("blocked_ips", []) or []
     window = payload.get("log_window") or {}
     window_text = f"  ({window.get('start', '?')} → {window.get('end', '?')})" if window else ""
@@ -312,6 +323,7 @@ def print_console_report(run_dir: str | Path, *, stream: TextIO = sys.stdout) ->
         lines.append(f"分析日志: {_fmt_count(payload.get('analyzed_log_count'))} 条")
     lines.append(
         f"候选恶意 IP: {payload.get('candidate_ip_count', 0)} | "
+        f"建议封禁: {payload.get('recommended_count', len(recommended_ips))} | "
         f"实际封禁: {payload.get('blocked_count', 0)} | "
         f"跳过: {payload.get('skipped_count', 0)}"
     )
@@ -320,10 +332,10 @@ def print_console_report(run_dir: str | Path, *, stream: TextIO = sys.stdout) ->
         lines.append("")
         lines.extend(dim_lines)
     lines.append("")
-    lines.append("已封禁 IP 证据链:")
-    if not blocked_ips:
+    lines.append("建议封禁 IP 证据链:")
+    if not recommended_ips:
         lines.append("  无")
-    for index, row in enumerate(blocked_ips, start=1):
+    for index, row in enumerate(recommended_ips, start=1):
         lines.append(
             f"[{index}] {row.get('ip', '')}   评分 {row.get('final_score', '')}  "
             f"攻击 {row.get('attack_count', '')}  {row.get('recommendation', '')}"
@@ -336,6 +348,20 @@ def print_console_report(run_dir: str | Path, *, stream: TextIO = sys.stdout) ->
             lines.append(f"    证据: {row.get('evidence_summary', '')}")
         if row.get("recommendation_reasons"):
             lines.append(f"    理由: {row.get('recommendation_reasons', '')}")
+        if _truthy(row.get("blocked_this_run", "")):
+            execution = "本次已封禁"
+        elif _truthy(row.get("already_blacklisted", "")):
+            execution = "此前已在黑名单"
+        elif row.get("skip_reason"):
+            execution = f"未执行（{row.get('skip_reason')}）"
+        else:
+            execution = "仅建议，未执行"
+        lines.append(f"    执行状态: {execution}")
+    lines.append("")
+    lines.append("审计文件:")
+    lines.append(f"  Markdown报告: {run_path / 'reports' / 'daily_report.md'}")
+    lines.append(f"  JSON报告: {run_path / 'reports' / 'daily_report.json'}")
+    lines.append(f"  处置建议CSV: {run_path / 'analysis' / 'blocklist_recommendations.normalized.csv'}")
     stream.write(redact_secrets("\n".join(lines) + "\n"))
     return len(blocked_ips)
 
@@ -376,6 +402,15 @@ def _load_report_payload(run_path: Path) -> dict[str, Any]:
                         "defense_posture", "temporal_patterns", "attack_chains"):
                 if not payload.get(key):
                     payload[key] = stats.get(key)
+            normalized = run_path / "analysis" / "blocklist_recommendations.normalized.csv"
+            if normalized.is_file() and not payload.get("recommended_ips"):
+                try:
+                    rows = _read_rows(normalized)
+                except OSError:
+                    rows = []
+                recommended = _recommended_rows(rows)
+                payload["recommended_count"] = len(recommended)
+                payload["recommended_ips"] = [_evidence(row) for row in recommended]
             return payload
 
     manifest = _load_manifest(run_path)
@@ -389,6 +424,7 @@ def _load_report_payload(run_path: Path) -> dict[str, Any]:
         except OSError:
             rows = []
     blocked = [row for row in rows if _truthy(row.get("blocked_this_run", ""))]
+    recommended = _recommended_rows(rows)
     skipped = [row for row in rows if row.get("skip_reason")]
     total = stats.get("total_records")
     return {
@@ -403,7 +439,9 @@ def _load_report_payload(run_path: Path) -> dict[str, Any]:
         "temporal_patterns": stats.get("temporal_patterns"),
         "attack_chains": stats.get("attack_chains") or [],
         "candidate_ip_count": len(rows),
+        "recommended_count": len(recommended),
         "blocked_count": len(blocked),
         "skipped_count": len(skipped),
+        "recommended_ips": [_evidence(row) for row in recommended],
         "blocked_ips": [_evidence(row) for row in blocked],
     }
