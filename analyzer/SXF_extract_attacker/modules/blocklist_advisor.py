@@ -349,15 +349,34 @@ def _rate_matching(
     patterns: Tuple[str, ...],
     excluded: Tuple[str, ...] = (),
 ) -> float:
+    """计算命中 patterns 且未命中 excluded 的行占比（向量化）。
+
+    语义与原逐行实现一致：ASCII 模式按词边界匹配，非 ASCII（中文）按子串匹配。
+    """
     values = series.fillna("").astype(str).str.strip().str.lower()
     if values.empty:
         return 0.0
-    return round(values.apply(
-        lambda value: (
-            any(_text_matches(value, pattern) for pattern in patterns)
-            and not any(_text_matches(value, pattern) for pattern in excluded)
-        )
-    ).mean(), 4)
+
+    def _build_alternation(pats: Tuple[str, ...]):
+        ascii_pats, text_pats = [], []
+        for pattern in pats:
+            lowered = pattern.lower()
+            (ascii_pats if lowered.isascii() else text_pats).append(re.escape(lowered))
+        alternatives = []
+        if ascii_pats:
+            alternatives.append("(?<![a-z0-9])(?:" + "|".join(ascii_pats) + ")(?![a-z0-9])")
+        if text_pats:
+            alternatives.append("(?:" + "|".join(text_pats) + ")")
+        return "|".join(alternatives) if alternatives else None
+
+    include = _build_alternation(patterns)
+    if include is None:
+        return 0.0
+    hits = values.str.contains(include, regex=True, na=False)
+    exclude = _build_alternation(excluded) if excluded else None
+    if exclude is not None:
+        hits = hits & ~values.str.contains(exclude, regex=True, na=False)
+    return round(float(hits.mean()), 4)
 
 
 def _score_behavior_confidence(ip_data: pd.DataFrame, cols: Dict[str, Optional[str]]) -> Dict[str, Any]:
@@ -705,10 +724,15 @@ class BlocklistAdvisor:
 
             threat_col = self.cols.get("threat_type")
             if threat_col and threat_col in self.df.columns:
-                self.max_diversity = max(
-                    self.df[self.df[ip_col].astype(str) == ip][threat_col].nunique()
-                    for ip in self.ip_counts
-                ) if self.ip_counts else 1
+                # 向量化：一次 groupby 求每个 IP 的威胁类型数，避免逐 IP 全表扫描
+                valid = self.df[ip_col].notna()
+                src = self.df.loc[valid, ip_col].astype(str)
+                threats = self.df.loc[valid, threat_col]
+                if len(src):
+                    per_ip_nunique = threats.groupby(src).nunique()
+                    self.max_diversity = int(per_ip_nunique.max())
+                else:
+                    self.max_diversity = 1
             else:
                 self.max_diversity = 1
         else:
@@ -753,12 +777,12 @@ class BlocklistAdvisor:
             unique_descs = list(dict.fromkeys(descs))[:5]
             evidence["sample_descriptions"] = unique_descs
 
-        # 数据包证据
+        # 数据包证据：直接用已过滤的 ip_data（原来传 self.df 会再次全表扫描）
         packet_col = next((c for c in self.df.columns if "数据包" in str(c) or "packet" in str(c).lower()), None)
         ip_col = self.cols.get("src_ip")
-        if packet_col and ip_col and ip_col in self.df.columns:
+        if packet_col and ip_col and ip_col in ip_data.columns:
             evidence["packet_evidence"] = _extract_packet_evidence(
-                self.df, ip, ip_col, packet_col
+                ip_data, ip, ip_col, packet_col
             )
 
         # 目标 URL
@@ -808,10 +832,12 @@ class BlocklistAdvisor:
             eligible_ips, self.db, self.current_execution_id
         )
 
+        # 一次性转 str，避免逐 IP 循环里重复全列 astype + 全表扫描
+        src_full = self.df[ip_col].astype(str)
         filtered = []
         for ip in eligible_ips:
             count = self.ip_counts[ip]
-            ip_data = self.df[self.df[ip_col].astype(str) == ip]
+            ip_data = self.df[src_full == ip]
             evidence = self._compile_evidence(ip, ip_data)
             packet_evidence = evidence.get("packet_evidence", {})
             base_score, score_details = _score_ip(

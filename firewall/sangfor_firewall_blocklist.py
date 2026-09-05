@@ -107,6 +107,19 @@ def build_entries(targets, description):
     return entries
 
 
+def build_unblock_entries(targets):
+    """解除封禁的条目：删除只需 url + type，不需要 description。"""
+    entries = []
+    seen = set()
+    for target in targets:
+        value = target.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        entries.append({"url": value, "type": "BLACK"})
+    return entries
+
+
 def default_description(today=None):
     today = today or date.today()
     return f"{today.month}月封禁"
@@ -238,6 +251,27 @@ class BlacklistClient:
             raise HttpError(f"封禁请求失败，HTTP {status}: {detail}")
         return status, headers, body
 
+    def unblock(self, targets):
+        """解除封禁：从黑名单删除目标。
+
+        实测抓包：POST /api/batch/v1/namespaces/public/whiteblacklist/?_method=delete
+        请求体为 [{"url": "<addr>", "type": "BLACK"}]（无需 description）。
+        """
+        entries = build_unblock_entries(targets)
+        if not entries:
+            raise ValueError("没有可解除封禁的目标")
+        data = json.dumps(entries, ensure_ascii=False).encode("utf-8")
+        status, headers, body = self._request(
+            "POST",
+            "/api/batch/v1/namespaces/public/whiteblacklist/?_method=delete",
+            data=data,
+            extra_headers=self._ajax_headers(),
+        )
+        if status >= 400:
+            detail = body[:500].decode("utf-8", errors="replace")
+            raise HttpError(f"解除封禁请求失败，HTTP {status}: {detail}")
+        return status, headers, body
+
     def _request(self, method, path, *, data=None, extra_headers=None):
         headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
@@ -292,6 +326,7 @@ def parse_args(argv):
     parser.add_argument("--check-login", action="store_true", help="只检查 Cookie 是否可访问首页")
     parser.add_argument("--export", action="store_true", help="导出并下载当前黑名单")
     parser.add_argument("--execute", action="store_true", help="真正提交封禁；不加则只 dry-run")
+    parser.add_argument("--unblock", action="store_true", help="对目标执行解除封禁（从黑名单删除）")
     return parser.parse_args(argv)
 
 
@@ -322,6 +357,21 @@ def main(argv=None):
         print(f"downloaded={output_path}")
 
     targets = read_targets(args)
+    if args.unblock:
+        entries = build_unblock_entries(targets)
+        if entries:
+            print(json.dumps(entries, ensure_ascii=False, indent=2))
+            if args.execute:
+                status, _, body = client.unblock(targets)
+                print(f"unblock HTTP {status}")
+                print(body[:1000].decode("utf-8", errors="replace"))
+            else:
+                print("dry-run: 加 --execute 才会真正提交解除封禁")
+        elif not args.export:
+            print("没有提供解除封禁目标。可传入参数或使用 --file。", file=sys.stderr)
+            return 2
+        return 0
+
     entries = build_entries(targets, args.description)
     if entries:
         print(json.dumps(entries, ensure_ascii=False, indent=2))

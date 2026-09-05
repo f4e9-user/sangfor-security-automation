@@ -79,9 +79,22 @@ Run stages through the pipeline module:
 python -m pipeline.run_pipeline check-sessions
 python -m pipeline.run_pipeline export-logs --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
 python -m pipeline.run_pipeline export-firewall-blacklist
+python -m pipeline.run_pipeline merge-logs --days 30
+python -m pipeline.run_pipeline review --mode cached --days 30 --min-block-age 30
 python -m pipeline.run_pipeline analyze
 python -m pipeline.run_pipeline block
 python -m pipeline.run_pipeline full --start "2026-07-06 00:00:00" --end "2026-07-06 23:59:59"
+
+`merge-logs` 是纯本地只读命令：按各 run 的导出窗口（`exports/manifest-*.json` 的
+`requested_start/end`）挑出与近 N 天相交的日志导出，合并去重后输出到
+`outputs/merged_logs/`（合并明细 CSV + 攻击者最后活跃 CSV + 覆盖报告），不访问设备。
+覆盖不足或数据偏旧会在报告中提示。
+
+`review --mode cached` 复查月度自动封禁黑名单 IP：候选解除 = 黑名单里描述匹配
+`N月(自动)封禁`（兼容新旧两种模板：pipeline 的 `N月自动封禁` 与旧版脚本的 `N月封禁`）
+的 IP，且近期（默认 30 天）无攻击流量、封禁超过 `--min-block-age` 天、且不在白名单。
+纯本地只读，只输出候选列表（`outputs/blacklist_review/`），**不执行解除**——
+解除需防火墙删除接口，`--mode fresh` 尚未实现。
 ```
 
 `block` is dry-run by default. Real firewall changes require `--apply`; `full --apply` first writes dry-run artifacts and then runs the apply stage with same-run prerequisite checks.

@@ -12,6 +12,7 @@ from typing import Iterable
 
 import pandas as pd
 
+from .excelio import read_export_excel
 from .redaction import redact_secrets
 
 NORMALIZED_RECOMMENDATION_FIELDS = [
@@ -154,6 +155,56 @@ def block_command(root: Path, session_file: Path, targets_file: Path, descriptio
     return command
 
 
+def unblock_command(root: Path, session_file: Path, targets_file: Path, *, apply: bool) -> list[str]:
+    """构造解除封禁子进程命令：firewall 脚本 --unblock 模式。"""
+    command = [
+        sys.executable,
+        str(root / "firewall" / "sangfor_firewall_blocklist.py"),
+        "--session-file",
+        str(session_file),
+        "--file",
+        str(targets_file),
+        "--unblock",
+    ]
+    if apply:
+        command.append("--execute")
+    return command
+
+
+def write_unblock_artifacts(targets: list[str], unblock_dir: str | Path, *, apply: bool) -> tuple[Path, Path]:
+    """写入解除封禁的 dry-run 产物（targets.txt + dry_run.json）。"""
+    unblock_path = Path(unblock_dir)
+    unblock_path.mkdir(parents=True, exist_ok=True)
+    targets_path = unblock_path / "targets.txt"
+    dry_run_path = unblock_path / "dry_run.json"
+    targets_path.write_text("\n".join(targets) + ("\n" if targets else ""), encoding="utf-8")
+    dry_run_path.write_text(
+        _json_dumps({"apply": apply, "target_count": len(targets), "targets": targets}),
+        encoding="utf-8",
+    )
+    return targets_path, dry_run_path
+
+
+def write_unblock_apply_result(targets: list[str], unblock_dir: str | Path, *, executed: bool, command_result: CommandResult | None = None) -> Path:
+    """写入解除封禁的执行结果（apply_result.json），与 block 阶段审计格式一致。"""
+    unblock_path = Path(unblock_dir)
+    unblock_path.mkdir(parents=True, exist_ok=True)
+    path = unblock_path / "apply_result.json"
+    payload = {
+        "apply": True,
+        "status": "executed" if executed else "not_requested",
+        "target_count": len(targets),
+        "targets": targets,
+    }
+    if command_result is not None:
+        payload["command"] = [redact_secrets(part) for part in command_result.args]
+        payload["returncode"] = command_result.returncode
+        payload["stdout"] = command_result.stdout
+        payload["stderr"] = command_result.stderr
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def normalize_recommendations(raw_csv: str | Path, output_csv: str | Path, *, source_report: str | Path = "") -> Path:
     raw_path = Path(raw_csv)
     out_path = Path(output_csv)
@@ -281,9 +332,7 @@ def prepare_analysis_input(exports_dir: str | Path) -> Path:
     frames = []
     expected_columns = None
     for source, segment in zip(sources, segments):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Workbook contains no default style")
-            frame = pd.read_excel(source, engine="openpyxl", skiprows=7)
+        frame = read_export_excel(source)
         declared_count = int(segment.get("count", len(frame)))
         actual_count = len(frame)
         if tolerate_count_drift:

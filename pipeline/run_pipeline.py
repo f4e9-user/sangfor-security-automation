@@ -24,10 +24,15 @@ from .commands import (
     rewrite_normalized_with_selection,
     run_subprocess,
     select_block_targets,
+    unblock_command,
     write_apply_result,
     write_block_artifacts,
+    write_unblock_apply_result,
+    write_unblock_artifacts,
 )
 from .config import PipelineConfig, schedule_window
+from .merge_logs import merge_recent_logs
+from .review import review_auto_blocked
 from .reports import print_console_report, read_exported_log_count, write_daily_report
 from .sessions import (
     MissingSessionError,
@@ -67,6 +72,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("export-firewall-blacklist")
 
+    merge_logs = subparsers.add_parser("merge-logs", help="合并近 N 天所有 run 导出的攻击日志（纯本地只读）")
+    merge_logs.add_argument("--days", type=int, default=30, help="合并最近多少天的日志（默认 30）")
+    merge_logs.add_argument("--output-dir", default=None, help="输出目录，默认 outputs/merged_logs")
+
+    review = subparsers.add_parser("review", help="复查自动封禁黑名单 IP 近 N 天是否仍有攻击流量")
+    review.add_argument("--mode", choices=("cached", "fresh"), default="cached", help="数据源模式；fresh 需解除封禁防火墙 API，暂未实现")
+    review.add_argument("--days", type=int, default=30, help="检查近多少天的攻击流量（默认 30）")
+    review.add_argument("--min-block-age", dest="min_block_age_days", type=int, default=30, help="封禁不满多少天不进入解除候选（默认 30）")
+    review.add_argument("--whitelist", default=None, help="白名单文件路径，默认重载 config 里的 whitelist_file")
+    review.add_argument("--output-dir", default=None, help="复查产物目录，默认 outputs/blacklist_review")
+
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("--xlsx")
     analyze.add_argument("--blacklist")
@@ -75,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     block.add_argument("--recommendations")
     block.add_argument("--apply", action="store_true")
     block.add_argument("--manual-override-reason", help="Required audit reason when applying an explicit external recommendations file")
+
+    unblock = subparsers.add_parser("unblock", help="解除封禁：从黑名单删除目标（dry-run 默认，--apply 才执行）")
+    unblock.add_argument("--targets", required=True, help="待解除 IP 清单文件，每行一个 IP")
+    unblock.add_argument("--apply", action="store_true", help="真正提交解除封禁（需防火墙会话健康）")
 
     full = subparsers.add_parser("full")
     full.add_argument("--start", required=True)
@@ -157,10 +177,22 @@ def run_command(argv: list[str] | None = None) -> int:
             runner.export_logs(args.start, args.end, args.favorite_name, args.export_date)
         elif args.command == "export-firewall-blacklist":
             runner.export_firewall_blacklist()
+        elif args.command == "merge-logs":
+            runner.merge_logs(days=args.days, output_dir=Path(args.output_dir) if args.output_dir else None)
+        elif args.command == "review":
+            runner.review(
+                mode=args.mode,
+                days=args.days,
+                min_block_age_days=args.min_block_age_days,
+                whitelist_file=Path(args.whitelist) if args.whitelist else None,
+                output_dir=Path(args.output_dir) if args.output_dir else None,
+            )
         elif args.command == "analyze":
             runner.analyze(Path(args.xlsx) if args.xlsx else None, Path(args.blacklist) if args.blacklist else None)
         elif args.command == "block":
             runner.block(Path(args.recommendations) if args.recommendations else None, apply=args.apply, manual_override_reason=args.manual_override_reason)
+        elif args.command == "unblock":
+            runner.unblock(Path(args.targets), apply=args.apply)
         elif args.command == "full":
             runner.full(args.start, args.end, args.favorite_name, args.export_date, apply=args.apply, report=args.report)
         elif args.command == "scheduled":
@@ -332,6 +364,77 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "exported firewall blacklist", {"blacklist": str(output)})
         return output
 
+    def merge_logs(self, *, days: int = 30, output_dir: Path | None = None) -> dict:
+        """合并近 N 天所有 run 导出的攻击日志（纯本地只读，不访问设备）。"""
+        stage = "merge-logs"
+        self.manifest.start_stage(stage, {"days": days})
+        self.events.emit(stage, "INFO", "stage_started", "merging recent exported logs", {"days": days})
+        try:
+            coverage = merge_recent_logs(self.config.paths.runs_dir, output_dir, days=days)
+        except Exception as exc:
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            self.events.emit(stage, "ERROR", "stage_failed", str(exc))
+            raise
+        self.manifest.set_output("merged_logs_coverage", coverage.get("outputs", {}).get("coverage_json"))
+        self.manifest.set_output("merged_logs_csv", coverage.get("outputs", {}).get("merged_csv"))
+        details = {
+            "days": days,
+            "total_rows": coverage.get("total_rows"),
+            "unique_source_ips": coverage.get("unique_source_ips"),
+            "runs_used": len(coverage.get("runs_used") or []),
+            "coverage": coverage.get("outputs", {}).get("coverage_json"),
+        }
+        self.manifest.finish_stage(stage, "completed", details=details)
+        self.events.emit(stage, "INFO", "stage_completed", "merged recent exported logs", details)
+        return coverage
+
+    def review(
+        self,
+        *,
+        mode: str = "cached",
+        days: int = 30,
+        min_block_age_days: int = 30,
+        whitelist_file: Path | None = None,
+        output_dir: Path | None = None,
+    ) -> dict:
+        """复查自动封禁黑名单 IP 近 N 天是否仍有攻击流量。
+
+        cached 模式复用已导出的日志与最近黑名单；fresh 需解除封禁防火墙 API，未实现。
+        """
+        stage = "review"
+        if mode == "fresh":
+            self.events.emit(stage, "INFO", "stage_started", "review fresh mode requested", {"mode": mode})
+            error = "fresh 模式需要解除封禁的防火墙 API，尚未实现（当前仅支持 --mode cached）"
+            self.manifest.finish_stage(stage, "failed", error=error)
+            raise NotImplementedError(error)
+        self.manifest.start_stage(stage, {"mode": mode, "days": days, "min_block_age_days": min_block_age_days})
+        self.events.emit(stage, "INFO", "stage_started", "reviewing auto-blocked blacklist IPs", {"mode": mode, "days": days})
+        whitelist = whitelist_file or Path(self.config.analysis.whitelist_file)
+        output = output_dir or self.config.paths.outputs_dir / "blacklist_review"
+        try:
+            summary = review_auto_blocked(
+                self.config.paths.runs_dir,
+                days=days,
+                min_block_age_days=min_block_age_days,
+                whitelist_file=whitelist,
+                output_dir=output,
+            )
+        except Exception as exc:
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            self.events.emit(stage, "ERROR", "stage_failed", str(exc))
+            raise
+        details = {
+            "mode": summary["mode"],
+            "candidates_count": summary["candidates_count"],
+            "still_active_count": summary["still_active_count"],
+            "whitelisted_ips": summary["whitelisted_ips"],
+            "blocked_too_recent_count": summary["blocked_too_recent_count"],
+            "report": summary["outputs"]["report_json"],
+        }
+        self.manifest.finish_stage(stage, "completed", details=details)
+        self.events.emit(stage, "INFO", "stage_completed", "review completed", details)
+        return summary
+
     def analyze(self, xlsx: Path | None = None, blacklist: Path | None = None, *, persist_history: bool = False) -> Path:
         stage = "analyze"
         xlsx = xlsx or prepare_analysis_input(self.artifacts.exports_dir)
@@ -418,6 +521,49 @@ class PipelineRunner:
         self.manifest.finish_stage(stage, "completed", details={"target_count": len(selection.targets), "apply": apply})
         self.events.emit(stage, "INFO", "stage_completed", "selected block targets", {"target_count": len(selection.targets), "apply": apply})
         return selection.targets
+
+    def unblock(self, targets_file: Path, *, apply: bool = False) -> list[str]:
+        """解除封禁：从黑名单删除指定 IP（dry-run 默认，--apply 才真正执行）。"""
+        stage = "unblock"
+        self.manifest.start_stage(stage, {"targets_file": str(targets_file), "apply": apply})
+        self.events.emit(stage, "INFO", "stage_started", "preparing unblock targets", {"targets_file": str(targets_file), "apply": apply})
+
+        targets = [line.strip() for line in targets_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not targets:
+            error = f"targets 文件为空或不可读: {targets_file}"
+            self.manifest.finish_stage(stage, "failed", error=error)
+            raise ValueError(error)
+        targets = list(dict.fromkeys(targets))  # 去重保序
+
+        unblock_dir = self.artifacts.run_dir / "unblock"
+        if apply:
+            firewall_health = check_firewall_session_health(self.config.paths.firewall_session_file)
+            self._write_status("firewall_session.status.json", firewall_health, str(self.config.paths.firewall_session_file))
+            if not firewall_health.get("healthy"):
+                self.manifest.finish_stage(stage, "failed", error="unblock apply requires healthy firewall session")
+                raise RuntimeError("unblock apply requires healthy firewall session")
+        targets_path, dry_run_path = write_unblock_artifacts(targets, unblock_dir, apply=apply)
+        self.manifest.set_output("unblock_targets", str(targets_path))
+        self.manifest.set_output("unblock_dry_run", str(dry_run_path))
+
+        apply_result_path = write_unblock_apply_result(targets, unblock_dir, executed=False)
+        self.manifest.set_output("unblock_apply_result", str(apply_result_path))
+        if apply:
+            command = unblock_command(self.config.root_dir, self.config.paths.firewall_session_file, targets_path, apply=True)
+            result = run_subprocess(
+                command,
+                stdout_path=self.artifacts.logs_dir / "unblock.stdout.log",
+                stderr_path=self.artifacts.logs_dir / "unblock.stderr.log",
+            )
+            apply_result_path = write_unblock_apply_result(targets, unblock_dir, executed=result.returncode == 0, command_result=result)
+            self.manifest.set_output("unblock_apply_result", str(apply_result_path))
+            if result.returncode != 0:
+                self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
+                self.events.emit(stage, "ERROR", "stage_failed", "unblock apply failed", {"returncode": result.returncode})
+                raise RuntimeError(f"unblock apply failed with exit code {result.returncode}")
+        self.manifest.finish_stage(stage, "completed", details={"target_count": len(targets), "apply": apply})
+        self.events.emit(stage, "INFO", "stage_completed", "unblock stage completed", {"target_count": len(targets), "apply": apply})
+        return targets
 
     def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False, report: bool = True) -> None:
         self.events.emit("full", "INFO", "stage_started", "starting full pipeline", {"start": start, "end": end, "apply": apply})

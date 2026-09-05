@@ -7,6 +7,7 @@ from pathlib import Path
 from sangfor_firewall_blocklist import (
     BlacklistClient,
     build_entries,
+    build_unblock_entries,
     csrf_token_from_cookie,
     default_description,
     extract_export_file,
@@ -145,6 +146,50 @@ class AutoBlocklistTests(unittest.TestCase):
             json.loads(call["data"].decode("utf-8")),
             {"moduleName": "blacklist", "filter": [], "isAll": True, "exportType": "CSV"},
         )
+
+    def test_build_unblock_entries_only_url_and_type(self):
+        entries = build_unblock_entries(["87.236.176.112", "", "87.236.176.112", "1.2.3.4"])
+        self.assertEqual(
+            entries,
+            [
+                {"url": "87.236.176.112", "type": "BLACK"},
+                {"url": "1.2.3.4", "type": "BLACK"},
+            ],
+        )
+
+    def test_unblock_posts_delete_spoof_to_whiteblacklist_endpoint(self):
+        transport = FakeTransport()
+        client = BlacklistClient(
+            base_url="https://firewall.local",
+            cookie="SESSID=abc; x-anti-csrf-gcs=csrf-cookie",
+            csrf_token="csrf-header",
+            transport=transport,
+        )
+
+        client.unblock(["87.236.176.112"])
+
+        self.assertEqual(len(transport.calls), 1)
+        call = transport.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(
+            call["url"],
+            "https://firewall.local/api/batch/v1/namespaces/public/whiteblacklist/?_method=delete",
+        )
+        self.assertEqual(call["headers"]["Cookie"], "SESSID=abc; x-anti-csrf-gcs=csrf-cookie")
+        self.assertEqual(call["headers"]["_cftoken"], "csrf-header")
+        self.assertEqual(call["headers"]["Content-Type"], "application/json")
+        self.assertEqual(
+            json.loads(call["data"].decode("utf-8")),
+            [{"url": "87.236.176.112", "type": "BLACK"}],
+        )
+
+    def test_parse_args_unblock_flag(self):
+        args = parse_args(["--unblock", "--file", "/tmp/targets.txt"])
+        self.assertTrue(args.unblock)
+        self.assertFalse(args.execute)
+        args_exec = parse_args(["--unblock", "--execute", "--file", "/tmp/targets.txt"])
+        self.assertTrue(args_exec.unblock)
+        self.assertTrue(args_exec.execute)
 
     def test_download_export_uses_empty_post_body(self):
         with tempfile.TemporaryDirectory() as tmpdir:

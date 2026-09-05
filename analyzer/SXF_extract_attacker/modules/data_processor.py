@@ -64,9 +64,14 @@ def detect_report_type(input_file):
 
 
 def read_excel_file(input_file, skiprows):
-    """读取Excel文件"""
+    """读取Excel文件（优先 calamine 引擎加速，缺失回退 openpyxl）"""
     try:
-        df = pd.read_excel(input_file, engine='openpyxl', skiprows=skiprows)
+        try:
+            import python_calamine  # noqa: F401
+            engine = 'calamine'
+        except ImportError:
+            engine = 'openpyxl'
+        df = pd.read_excel(input_file, engine=engine, skiprows=skiprows)
     except Exception as e:
         print(f"错误：读取 Excel 失败 - {e}", file=sys.stderr)
         sys.exit(1)
