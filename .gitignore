@@ -14,6 +14,9 @@ logs/
 data/
 .playwright-browsers/
 
+# 含内网地址的本地文档：只留本地，不入库（2026-09-20 用户要求）
+docs/sip-query-reference.md
+
 # Local editor and OS noise
 .DS_Store
 .vscode/
