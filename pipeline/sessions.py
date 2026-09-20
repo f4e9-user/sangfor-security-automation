@@ -54,6 +54,11 @@ def check_sip_session_health(path: str | Path, *, timeout: float = 10.0) -> dict
             "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/json",
             "Accept": "application/json,*/*",
+            # 2026-09-20 实测：缺这个头时 SIP 对任何请求一律回
+            # `{"success":false,"message":"您没有权限进行此操作"}`（HTTP 200），
+            # 于是健康检查把「会话已失效」误判成健康（构造性假健康）。
+            # 带上 feature_id 才会走真正的会话校验并返回 `data.need_login`。
+            "feature_id": "/logsearch",
         }
         try:
             conn.request("POST", "/apps/secvisual/log_query2/ksearch_log/check_query_string", body=body, headers=headers)
@@ -62,14 +67,25 @@ def check_sip_session_health(path: str | Path, *, timeout: float = 10.0) -> dict
         finally:
             conn.close()
         obj = _try_json(payload)
-        need_login = bool(isinstance(obj, dict) and obj.get("data", {}).get("need_login") is True)
-        healthy = response.status < 400 and response.status != 302 and not need_login
+        status = response.status
+        body = obj if isinstance(obj, dict) else {}
+        need_login = bool((body.get("data") or {}).get("need_login") is True)
+        denied = body.get("success") is False and not need_login
+        healthy = status < 400 and status != 302 and not need_login and not denied
+        if need_login:
+            error = "SIP session expired: 用户未登录或会话已过期"
+        elif denied:
+            error = f"SIP query rejected: {body.get('message') or 'success=false'}"
+        elif not healthy:
+            error = f"SIP query failed: HTTP {status}"
+        else:
+            error = ""
         return {
             "healthy": healthy,
             "need_login": need_login,
-            "status": response.status,
+            "status": status,
             "session_file": str(session_path),
-            "error": "" if healthy else "SIP query requires login or failed",
+            "error": error,
         }
     except Exception as exc:
         return {"healthy": False, "need_login": None, "session_file": str(session_path), "error": str(exc)}
