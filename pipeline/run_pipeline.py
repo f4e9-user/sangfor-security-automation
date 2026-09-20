@@ -35,6 +35,7 @@ from .commands import (
     write_unblock_artifacts,
 )
 from .config import PipelineConfig, schedule_window
+from . import keepalive as keepalive_manager
 from .merge_logs import merge_recent_logs
 from .review import review_auto_blocked
 from .reports import print_console_report, read_exported_log_count, write_daily_report
@@ -67,9 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--chaojiying-codetype", help="Override Chaojiying codetype, e.g. 1004")
     login.add_argument("--browser-executable", help="Use an existing Chromium/Chrome executable for login helpers")
     login.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
-    login.add_argument("--firewall-keepalive", action=argparse.BooleanOptionalAction, default=False)
+    login.add_argument("--firewall-keepalive", action=argparse.BooleanOptionalAction, default=False,
+                       help="旧行为：让防火墙登录脚本带 keepalive 前台常驻（会阻塞 login；推荐用默认的 --keepalive）")
+    login.add_argument("--keepalive", action=argparse.BooleanOptionalAction, default=True,
+                       help="登录成功后自动启动 detached 后台保活（默认开；--no-keepalive 关闭）")
+    login.add_argument("--keepalive-interval", type=int, default=None,
+                       help="保活刷新间隔秒数（默认用各脚本的 300s）")
 
     subparsers.add_parser("check-sessions")
+
+    keepalive = subparsers.add_parser("keepalive", help="查看/停止登录后自动拉起的后台保活进程")
+    keepalive.add_argument("--target", choices=("all", "sip", "firewall"), default="all")
+    keepalive.add_argument("--stop", action="store_true", help="停止保活进程（默认只打印状态）")
 
     export_logs = subparsers.add_parser("export-logs")
     export_logs.add_argument("--start", required=True)
@@ -197,9 +207,13 @@ def run_command(argv: list[str] | None = None) -> int:
                 browser_executable=args.browser_executable,
                 headless=args.headless,
                 firewall_keepalive=args.firewall_keepalive,
+                keepalive_enabled=args.keepalive,
+                keepalive_interval=args.keepalive_interval,
             )
         elif args.command == "check-sessions":
             runner.check_sessions()
+        elif args.command == "keepalive":
+            runner.keepalive_control(target=args.target, stop=args.stop)
         elif args.command == "export-logs":
             runner.export_logs(args.start, args.end, args.favorite_name, args.export_date)
         elif args.command == "virus-servers":
@@ -398,6 +412,8 @@ class PipelineRunner:
         browser_executable: str | None = None,
         headless: bool = True,
         firewall_keepalive: bool = False,
+        keepalive_enabled: bool = True,
+        keepalive_interval: int | None = None,
     ) -> None:
         stage = "login"
         targets = ["sip", "firewall"] if target == "all" else [target]
@@ -452,7 +468,63 @@ class PipelineRunner:
                 self.manifest.finish_stage(stage, "failed", error=result.stderr or result.stdout)
                 raise RuntimeError(f"{item} login failed with exit code {result.returncode}")
             self.events.emit(stage, "INFO", "login_completed", f"{item} login completed", {"target": item})
+            if keepalive_enabled and not (item == "firewall" and firewall_keepalive):
+                self._start_keepalive(item, interval=keepalive_interval)
         self.manifest.finish_stage(stage, "completed", details={"target": target})
+
+    def _start_keepalive(self, target: str, *, interval: int | None = None) -> dict:
+        """登录成功后自动把该目标的保活拉成独立后台进程。
+
+        为什么是独立进程而不是前台常驻：`sangfor_firewall_login_session.py --keepalive` 会让
+        `login` 一直不返回（subprocess.run 无超时）；detached 进程登录完就能继续干活、
+        需要时用 `keepalive --stop` 收掉。保活失败只告警，不影响登录结果本身。
+        """
+        session_file = (
+            self.config.paths.sip_session_file if target == "sip" else self.config.paths.firewall_session_file
+        )
+        try:
+            info = keepalive_manager.start(
+                target,
+                root_dir=self.config.root_dir,
+                session_file=session_file,
+                logs_dir=Path(self.config.root_dir) / "logs",
+                state_dir=self.config.paths.state_dir,
+                interval=interval,
+            )
+        except Exception as exc:  # noqa: BLE001 - 保活失败不应让登录阶段失败
+            self.events.emit("login", "WARNING", "keepalive_start_failed", f"{target} keepalive not started: {exc}")
+            print(f"[login] {target} 保活未启动：{exc}")
+            return {"target": target, "started": False, "error": str(exc)}
+        if info.get("started"):
+            self.events.emit("login", "INFO", "keepalive_started", f"{target} keepalive started",
+                             {"pid": info.get("pid"), "log": info.get("log")})
+            print(f"[login] {target} 保活已启动：pid={info.get('pid')}，日志 {info.get('log')}")
+        else:
+            print(f"[login] {target} 保活已在运行：pid={info.get('pid')}（{info.get('reason', '')}）")
+        return info
+
+    def keepalive_control(self, *, target: str = "all", stop: bool = False) -> None:
+        """查看/停止登录后自动拉起的保活进程。"""
+        stage = "keepalive"
+        targets = list(keepalive_manager.TARGETS) if target == "all" else [target]
+        self.manifest.start_stage(stage, {"target": target, "stop": stop})
+        self.events.emit(stage, "INFO", "stage_started", "keepalive control", {"target": target, "stop": stop})
+        results: list[dict] = []
+        try:
+            for item in targets:
+                if stop:
+                    info = keepalive_manager.stop(item, state_dir=self.config.paths.state_dir)
+                    print(f"[keepalive] {item}: {'已停止' if info.get('stopped') else '未在运行'}（pid={info.get('pid')}）")
+                else:
+                    info = keepalive_manager.status(item, state_dir=self.config.paths.state_dir)
+                    print(f"[keepalive] {item}: {'运行中' if info.get('running') else '未运行'} "
+                          f"pid={info.get('pid')} 日志={info.get('log')}")
+                results.append(info)
+            self.manifest.finish_stage(stage, "completed", details={"results": results})
+            self.events.emit(stage, "INFO", "stage_completed", "keepalive control done", {"results": results})
+        except Exception as exc:  # noqa: BLE001 - 阶段失败照常记录并抛出
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            raise
 
     def check_sessions(self) -> None:
         stage = "check-sessions"
