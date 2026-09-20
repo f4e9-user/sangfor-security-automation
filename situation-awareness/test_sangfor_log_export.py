@@ -26,6 +26,20 @@ def test_effective_split_limit_reserves_headroom_for_sip_count_drift():
     assert effective_split_limit(1) == 1
 
 
+def _write_valid_xlsx(path) -> None:
+    """写出一个最小的合法 xlsx。
+
+    2026-09-11 起 `adaptive_export_segments` 会在计数前校验下载得到的工作簿
+    （zip + 声明成员 + XML 良构），因此测试里的假下载不能再写 `b"candidate"`。
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active if wb.active is not None else wb.create_sheet()
+    ws["A1"] = "ok"
+    wb.save(path)
+
+
 def test_adaptive_export_splits_again_when_download_reaches_hard_limit(tmp_path):
     start = datetime(2026, 7, 24, 17, 0)
     end = datetime(2026, 7, 31, 16, 0)
@@ -33,7 +47,7 @@ def test_adaptive_export_splits_again_when_download_reaches_hard_limit(tmp_path)
 
     def export_candidate(segment, output_path):
         attempted.append(segment)
-        output_path.write_bytes(b"candidate")
+        _write_valid_xlsx(output_path)
         return f"server-{len(attempted)}"
 
     def row_counter(path):
@@ -65,7 +79,7 @@ def test_adaptive_export_rejects_unsplittable_interval_at_hard_limit(tmp_path):
     instant = datetime(2026, 7, 31, 16, 0)
 
     def export_candidate(segment, output_path):
-        output_path.write_bytes(b"candidate")
+        _write_valid_xlsx(output_path)
         return "server-file"
 
     try:

@@ -16,20 +16,38 @@ class RunManifest:
     def __init__(self, run_dir: str | Path, run_id: str, args: dict[str, Any]):
         self.run_dir = Path(run_dir)
         self.path = self.run_dir / "manifest.json"
+        previous = self._load_existing(run_id)
         self.data: dict[str, Any] = {
             "run_id": run_id,
-            "started_at": utc_now(),
+            "started_at": previous.get("started_at") or utc_now(),
             "ended_at": None,
             "status": "running",
             "args": redact_data(args),
-            "stages": {},
-            "inputs": {},
-            "outputs": {},
-            "target_count": 0,
-            "apply": False,
+            "stages": previous.get("stages") or {},
+            "inputs": previous.get("inputs") or {},
+            "outputs": previous.get("outputs") or {},
+            "target_count": previous.get("target_count", 0),
+            "apply": previous.get("apply", False),
             "error": None,
         }
         self.write()
+
+    def _load_existing(self, run_id: str) -> dict[str, Any]:
+        """复用已存在的 run 时保留既有阶段记录（``--run-id`` 续跑场景）。
+
+        否则 ``--run-id <id> block --apply`` 会先把 manifest 清空，而 apply 守卫要求
+        同 run 的 export-logs / export-firewall-blacklist / analyze 均为 completed，
+        导致补跑阶段必然失败（2026-09-11 实测踩到）。
+        """
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, dict) or data.get("run_id") != run_id:
+            return {}
+        return data
 
     def start_stage(self, name: str, details: dict[str, Any] | None = None) -> None:
         self.data["stages"][name] = {

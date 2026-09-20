@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
 import sys
-from datetime import date
+import threading
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -42,6 +46,9 @@ from .sessions import (
     validate_sip_session,
 )
 from .state import EventLogger, RunManifest
+from .virus_servers import analyze as analyze_virus_export
+from .virus_servers import load_export as load_virus_export
+from .virus_servers import write_outputs as write_virus_outputs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
     export_logs.add_argument("--favorite-name", default=None)
     export_logs.add_argument("--export-date", default=None)
 
+    virus = subparsers.add_parser(
+        "virus-servers",
+        help="病毒日志：内网服务器 TOP N + 各自外联 IP（本地分析；缺导出文件时按收藏夹导出）",
+    )
+    virus.add_argument("--favorite-name", default=None, help="SIP 收藏夹名称（默认「病毒」）")
+    virus.add_argument("--start", default=None)
+    virus.add_argument("--end", default=None)
+    virus.add_argument("--days", type=int, default=7, help="未给 --start/--end 时回溯的天数")
+    virus.add_argument("--export-path", default=None, help="直接分析已有导出 xlsx（不接触设备）")
+    virus.add_argument("--top", type=int, default=10, help="内网服务器取前 N（默认 10）")
+    virus.add_argument("--top-peers", type=int, default=None, help="每台服务器最多列出多少个外联 IP")
+
     subparsers.add_parser("export-firewall-blacklist")
 
     merge_logs = subparsers.add_parser("merge-logs", help="合并近 N 天所有 run 导出的攻击日志（纯本地只读）")
@@ -95,6 +114,14 @@ def build_parser() -> argparse.ArgumentParser:
     unblock = subparsers.add_parser("unblock", help="解除封禁：从黑名单删除目标（dry-run 默认，--apply 才执行）")
     unblock.add_argument("--targets", required=True, help="待解除 IP 清单文件，每行一个 IP")
     unblock.add_argument("--apply", action="store_true", help="真正提交解除封禁（需防火墙会话健康）")
+
+    firewall_phase = subparsers.add_parser(
+        "firewall-phase",
+        help="登录后短窗口内跑完防火墙相关阶段：黑名单导出 → 分析 → 封禁 → 日报（复用已有 SIP 导出）",
+    )
+    firewall_phase.add_argument("--apply", action="store_true", help="真正提交封禁；不加则只 dry-run")
+    firewall_phase.add_argument("--report", action=argparse.BooleanOptionalAction, default=True, help="print a console summary after completion (default: enabled)")
+    firewall_phase.add_argument("--xlsx", help="显式指定复用的 SIP 导出 xlsx（默认取本 run 记录，其次其他 run 最新导出）")
 
     full = subparsers.add_parser("full")
     full.add_argument("--start", required=True)
@@ -175,6 +202,16 @@ def run_command(argv: list[str] | None = None) -> int:
             runner.check_sessions()
         elif args.command == "export-logs":
             runner.export_logs(args.start, args.end, args.favorite_name, args.export_date)
+        elif args.command == "virus-servers":
+            runner.virus_servers(
+                favorite_name=args.favorite_name,
+                start=args.start,
+                end=args.end,
+                days=args.days,
+                export_path=Path(args.export_path) if args.export_path else None,
+                top=args.top,
+                top_peers=args.top_peers,
+            )
         elif args.command == "export-firewall-blacklist":
             runner.export_firewall_blacklist()
         elif args.command == "merge-logs":
@@ -193,6 +230,8 @@ def run_command(argv: list[str] | None = None) -> int:
             runner.block(Path(args.recommendations) if args.recommendations else None, apply=args.apply, manual_override_reason=args.manual_override_reason)
         elif args.command == "unblock":
             runner.unblock(Path(args.targets), apply=args.apply)
+        elif args.command == "firewall-phase":
+            runner.firewall_phase(apply=args.apply, report=args.report, xlsx=Path(args.xlsx) if args.xlsx else None)
         elif args.command == "full":
             runner.full(args.start, args.end, args.favorite_name, args.export_date, apply=args.apply, report=args.report)
         elif args.command == "scheduled":
@@ -210,6 +249,134 @@ def run_command(argv: list[str] | None = None) -> int:
         print(f"Events: {events.path}", flush=True)
         print(f"Pipeline log: {events.pipeline_log_path}", flush=True)
         return 1
+
+
+# 实测防火墙会话空闲几分钟就会失效（2026-09-11：17:57 登录 → 18:05 已 302），
+# 而 SIP 导出要 ~14 分钟，因此默认 120s 心跳一次；可用环境变量调。
+DEFAULT_FIREWALL_KEEPALIVE_SECONDS = int(os.environ.get("SANGFOR_FIREWALL_KEEPALIVE_SECONDS", "120"))
+
+
+def ping_firewall_session(session_file: Path, *, timeout: float = 30.0) -> tuple[bool, str]:
+    """轻量刷新：带会话 Cookie 请求 /framework.php，200 且未跳登录页即视为有效。
+
+    两个必须遵守的点（2026-09-11 踩过）：
+    1. **禁止跟随重定向**：会话失效时设备回 302 → login.php，而登录页本身是 HTTP 200，
+       跟随重定向会把失效判成健康（早期的心跳脚本就是这样给出假 200 的）。这里用自定义
+       opener 让 302 直接抛 HTTPError。
+    2. 不复用 ``firewall/firewall_keepalive.py``：它用 ``wait_until="networkidle"``，
+       在防火墙控制台上会超时，且第一次失败就 return 1 退出，不适合长跑保活。
+
+    每次读取最新的会话文件，因此期间手动刷新的 cookie 会被自动采用。
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+            return None
+
+    payload = json.loads(Path(session_file).read_text(encoding="utf-8"))
+    base_url = str(payload["base_url"]).rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/framework.php",
+        headers={
+            "Cookie": str(payload["cookie"]),
+            "User-Agent": "sangfor-pipeline-keepalive/1.0",
+            "Referer": f"{base_url}/framework.php",
+            "Accept": "text/html,*/*",
+        },
+    )
+    opener = urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = response.read(400).decode("utf-8", "replace")
+            healthy = response.status == 200 and "login.php" not in body
+            return healthy, f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - caller decides; keepalive must not raise
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def latest_export_xlsx(runs_dir: Path, *, exclude_run: Path | None = None) -> Path | None:
+    """在 runs/*/exports 里找最新的 SIP 导出文件（跨 run 复用已导出数据）。"""
+    candidates = [p for p in Path(runs_dir).glob("*/exports/*.xlsx") if not p.name.startswith(".")]
+    if exclude_run is not None:
+        excluded = Path(exclude_run).resolve()
+        candidates = [p for p in candidates if excluded not in p.resolve().parents]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+class FirewallKeepalive:
+    """后台线程周期性刷新防火墙会话，避免长阶段（如 80k 行的 SIP 导出约 14 分钟）期间空闲超时。
+
+    - 用 ``ping_firewall_session``（urllib 轻量 GET），不起浏览器；
+    - 单次失败只回调事件、不退出循环；会话真失效由阶段守卫（``_require_healthy_firewall``）报告；
+    - 重复 start 不重复起线程，stop 幂等。
+    """
+
+    def __init__(
+        self,
+        session_file: Path,
+        *,
+        interval: int = DEFAULT_FIREWALL_KEEPALIVE_SECONDS,
+        ping=None,
+        on_event=None,
+    ) -> None:
+        self.session_file = Path(session_file)
+        self.interval = max(0.05, float(interval))
+        self._ping = ping or (lambda: ping_firewall_session(self.session_file))
+        self._on_event = on_event
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="firewall-keepalive", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                healthy, detail = self._ping()
+            except Exception as exc:  # noqa: BLE001 - 保活线程绝不能把整条 run 带崩
+                healthy, detail = False, f"{type(exc).__name__}: {exc}"
+            if self._on_event is not None:
+                self._on_event(healthy, detail)
+
+    def __enter__(self) -> "FirewallKeepalive":
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self.stop()
+        return False
 
 
 class PipelineRunner:
@@ -344,10 +511,177 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "exported SIP logs", details)
         return analysis_input
 
+    def virus_servers(
+        self,
+        *,
+        favorite_name: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        days: int = 7,
+        export_path: Path | None = None,
+        top: int = 10,
+        top_peers: int | None = None,
+    ) -> Path:
+        """病毒日志 → 内网服务器 TOP N + 各自外联 IP。
+
+        未给 `export_path` 时按收藏夹导出（需要健康的 SIP 会话）；给了 `export_path` 则纯本地分析，
+        便于把「导出」与「分析」两个阶段拆开单独跑。
+        """
+        stage = "virus-servers"
+        fav = favorite_name or "病毒"
+        self.manifest.start_stage(stage, {
+            "favorite_name": fav,
+            "start": start,
+            "end": end,
+            "days": days,
+            "export_path": str(export_path) if export_path else None,
+            "top": top,
+        })
+        try:
+            if export_path is None:
+                now = datetime.now()
+                s = start or (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+                e = end or now.strftime("%Y-%m-%d %H:%M:%S")
+                self.events.emit(stage, "INFO", "stage_started", "exporting virus favorite logs",
+                                 {"favorite_name": fav, "start": s, "end": e})
+                xlsx = self.export_logs(s, e, fav, None)
+            else:
+                xlsx = Path(export_path)
+            meta, rows = load_virus_export(xlsx)
+            report = analyze_virus_export(rows, top=top, top_peers=top_peers)
+            paths = write_virus_outputs(self.artifacts.run_dir / "virus", meta, report)
+            details = {
+                "export": str(xlsx),
+                "favorite_name": fav,
+                "query_string": meta.query_string,
+                "rows": report["rows_total"],
+                "servers": report["servers_total"],
+                "top": top,
+                "artifacts": paths,
+            }
+            self.manifest.set_output("virus_report", paths["json"])
+            self.manifest.finish_stage(stage, "completed", details=details)
+            self.events.emit(stage, "INFO", "stage_completed", "virus servers analyzed", details)
+            print(f"[virus] 内网主机 {report['servers_total']} 台，参与明细 {report['rows_with_internal']} 行；TOP {top}：")
+            for srv in report["servers"]:
+                peers = "、".join(p["ip"] for p in srv["external_peers"][:5]) or "（无外联）"
+                print(f"  #{srv['rank']} {srv['ip']}  {srv['events']} 条  {srv['direction']}  外联: {peers}")
+            print(f"[virus] 报告: {paths['markdown']}")
+            return self.artifacts.run_dir / "virus"
+        except Exception as exc:
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            self.events.emit(stage, "ERROR", "stage_failed", str(exc), {"error_type": type(exc).__name__})
+            raise
+
+    def _resolve_export_input(self, explicit: Path | None = None) -> Path:
+        """确定分析要用的 SIP 导出文件：显式指定 > 本 run 记录/本 run exports 目录 > 其他 run 最新导出。
+
+        防火墙会话是硬性 TTL、SIP 导出又要十几分钟，所以「导出」和「封禁」必须分两次跑；
+        第二阶段得能复用已落盘的导出，而不是再导一遍。
+        """
+        if explicit is not None:
+            if not Path(explicit).exists():
+                raise FileNotFoundError(f"指定复用的 SIP 导出不存在: {explicit}")
+            return Path(explicit)
+        recorded = (self.manifest.data.get("outputs") or {}).get("analysis_input_xlsx")
+        if recorded and Path(recorded).exists():
+            self.events.emit("full", "INFO", "export_reused", "reusing this run's SIP export", {"xlsx": str(recorded)})
+            return Path(recorded)
+        try:
+            existing = prepare_analysis_input(self.artifacts.exports_dir)
+        except Exception:  # noqa: BLE001 - 本 run 还没有导出时退到跨 run 兜底
+            existing = None
+        if existing is not None and Path(existing).exists():
+            self.events.emit("full", "INFO", "export_reused", "reusing this run's SIP export", {"xlsx": str(existing)})
+            return Path(existing)
+        fallback = latest_export_xlsx(self.config.paths.runs_dir, exclude_run=self.artifacts.run_dir)
+        if fallback is None:
+            raise FileNotFoundError(
+                "没有可复用的 SIP 导出：请先跑 export-logs（或 full）把日志导出落盘，再执行 firewall-phase"
+            )
+        self.events.emit(
+            "full",
+            "WARNING",
+            "export_reused",
+            "reusing SIP export from another run",
+            {"xlsx": str(fallback), "source_run": fallback.parent.parent.name},
+        )
+        return fallback
+
+    def firewall_phase(self, *, apply: bool = False, report: bool = True, xlsx: Path | None = None) -> None:
+        """登录后的短窗口内跑完所有依赖防火墙的阶段：黑名单导出 → 分析 → 封禁 → 日报。
+
+        为什么要单独拆出来：防火墙会话实测是**硬性 TTL（约 12 分钟，活动不延长）**，而 SIP
+        导出约 14 分钟 —— `full` 一步式跑到 apply 时会话必然已失效。推荐用法：
+
+            1) `export-logs`（或 `full`：数据落盘即可，它会在 apply 守卫处停下并说明原因）
+            2) `login --target firewall` 刷新会话
+            3) 立刻 `firewall-phase --apply`（几秒到几分钟内跑完）
+        """
+        stage = "firewall-phase"
+        self.manifest.start_stage(stage, {"apply": apply, "xlsx": str(xlsx) if xlsx else None})
+        self.events.emit(stage, "INFO", "stage_started", "starting firewall phase", {"apply": apply})
+        try:
+            self._require_healthy_firewall(stage)  # 早失败，别让后面的阶段白跑
+            analysis_input = self._resolve_export_input(xlsx)
+            keepalive = FirewallKeepalive(self.config.paths.firewall_session_file)
+            keepalive.start()
+            self.events.emit(
+                stage,
+                "INFO",
+                "keepalive_started",
+                "firewall session keepalive running",
+                {"interval_seconds": DEFAULT_FIREWALL_KEEPALIVE_SECONDS},
+            )
+            try:
+                blacklist = self.export_firewall_blacklist()
+                recommendations = self.analyze(analysis_input, blacklist, persist_history=apply)
+                self.block(recommendations, apply=False)
+                if apply:
+                    self.block(recommendations, apply=True)
+                md_path, json_path = write_daily_report(self.artifacts.run_dir, self.manifest.data, recommendations)
+                self.manifest.set_output("daily_report_md", str(md_path))
+                self.manifest.set_output("daily_report_json", str(json_path))
+            finally:
+                keepalive.stop()
+                self.events.emit(stage, "INFO", "keepalive_stopped", "firewall session keepalive stopped")
+            details = {"apply": apply, "xlsx": str(analysis_input)}
+            self.manifest.finish_stage(stage, "completed", details=details)
+            self.events.emit(stage, "INFO", "stage_completed", "firewall phase completed", details)
+        except Exception as exc:
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            self.events.emit(stage, "ERROR", "stage_failed", str(exc), {"error_type": type(exc).__name__})
+            raise
+        if report:
+            print_console_report(self.artifacts.run_dir)
+
+    def _require_healthy_firewall(self, stage: str) -> dict:
+        """阶段开始前确认防火墙会话可用，失效时给出可执行的刷新指引。
+
+        会话空闲超时后设备会把 /framework.php 重定向到 login.php，导黑名单接口只会回
+        HTTP 400 request error —— 与其让调用方猜，不如在这里提前失败并说明怎么修。
+        """
+        health = check_firewall_session_health(self.config.paths.firewall_session_file)
+        self._write_status("firewall_session.status.json", health, str(self.config.paths.firewall_session_file))
+        if not health.get("healthy"):
+            hint = "（/framework.php 已跳转登录页，会话说失效）" if health.get("login_page") else ""
+            raise MissingSessionError(
+                f"{stage} 需要健康的防火墙会话{hint}，当前状态 {health.get('status')}；"
+                "请在浏览器中登录防火墙控制台后，从 devtools 抓取 Cookie 头与 _cftoken 请求头，"
+                f"写回 {self.config.paths.firewall_session_file} 的 cookie 与 csrf._cftoken 后重跑该阶段"
+            )
+        return health
+
     def export_firewall_blacklist(self) -> Path:
         stage = "export-firewall-blacklist"
         self.manifest.start_stage(stage)
         self.events.emit(stage, "INFO", "stage_started", "exporting firewall blacklist")
+        try:
+            self._require_healthy_firewall(stage)
+        except MissingSessionError as exc:
+            self.manifest.finish_stage(stage, "failed", error=exc)
+            self.events.emit(stage, "ERROR", "stage_failed", str(exc))
+            raise
         command = export_firewall_blacklist_command(self.config.root_dir, self.config.paths.firewall_session_file, self.artifacts.blacklist_dir)
         result = run_subprocess(
             command,
@@ -435,10 +769,26 @@ class PipelineRunner:
         self.events.emit(stage, "INFO", "stage_completed", "review completed", details)
         return summary
 
+    def _record_analysis_input(self, xlsx: Path) -> None:
+        """把分析用的 SIP 导出记进 manifest（路径 + sha256 + 字节数），供 apply 守卫审计。
+
+        `firewall-phase` 允许复用别的 run 已导出的数据，守卫据此确认「推荐结论有可追溯的
+        数据来源」，而不是凭空生成。
+        """
+        entry: dict[str, object] = {"path": str(xlsx)}
+        try:
+            entry["sha256"] = sha256_file(xlsx)
+            entry["bytes"] = Path(xlsx).stat().st_size
+        except OSError:
+            pass
+        self.manifest.data.setdefault("inputs", {})["sip_xlsx"] = entry
+        self.manifest.write()
+
     def analyze(self, xlsx: Path | None = None, blacklist: Path | None = None, *, persist_history: bool = False) -> Path:
         stage = "analyze"
         xlsx = xlsx or prepare_analysis_input(self.artifacts.exports_dir)
         blacklist = blacklist or self.artifacts.blacklist_dir / "sangfor_firewall_blacklists.csv"
+        self._record_analysis_input(xlsx)
         self.manifest.start_stage(stage, {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
         self.events.emit(stage, "INFO", "stage_started", "running attacker analysis", {"xlsx": str(xlsx), "blacklist": str(blacklist), "persist_history": persist_history})
         command, cwd = analyze_command(self.config.root_dir, xlsx, blacklist, self.config.analysis.db_path, self.config.analysis.whitelist_file, self.artifacts.analysis_dir, persist_history=persist_history, stats_out=self.artifacts.analysis_dir / "stats.json")
@@ -568,16 +918,40 @@ class PipelineRunner:
     def full(self, start: str, end: str, favorite_name: str | None, export_date: str | None, *, apply: bool = False, report: bool = True) -> None:
         self.events.emit("full", "INFO", "stage_started", "starting full pipeline", {"start": start, "end": end, "apply": apply})
         self.check_sessions()
-        xlsx = self.export_logs(start, end, favorite_name, export_date)
-        blacklist = self.export_firewall_blacklist()
-        recommendations = self.analyze(xlsx, blacklist, persist_history=apply)
-        self.block(recommendations, apply=False)
-        if apply:
-            self.block(recommendations, apply=True)
-        md_path, json_path = write_daily_report(self.artifacts.run_dir, self.manifest.data, recommendations, log_window=(start, end))
-        self.manifest.set_output("daily_report_md", str(md_path))
-        self.manifest.set_output("daily_report_json", str(json_path))
-        self.events.emit("full", "INFO", "stage_completed", "full pipeline completed", {"report": str(md_path), "report_json": str(json_path)})
+        keepalive = FirewallKeepalive(
+            self.config.paths.firewall_session_file,
+            on_event=lambda healthy, detail: self.events.emit(
+                "full",
+                "INFO" if healthy else "WARNING",
+                "keepalive_ping",
+                "firewall session keepalive refreshed" if healthy else "firewall session keepalive failed",
+                {"healthy": healthy, "detail": detail},
+            ),
+        )
+        keepalive.start()
+        self.events.emit(
+            "full",
+            "INFO",
+            "keepalive_started",
+            "firewall session keepalive running",
+            {"interval_seconds": DEFAULT_FIREWALL_KEEPALIVE_SECONDS},
+        )
+        try:
+            # 防火墙黑名单导出只需刚校验过的会话、耗时可忽略，因此排在 SIP 长导出之前；
+            # SIP 导出（80k 行约 14 分钟）放后面，避免防火墙会话在导出期间空闲超时。
+            blacklist = self.export_firewall_blacklist()
+            xlsx = self.export_logs(start, end, favorite_name, export_date)
+            recommendations = self.analyze(xlsx, blacklist, persist_history=apply)
+            self.block(recommendations, apply=False)
+            if apply:
+                self.block(recommendations, apply=True)
+            md_path, json_path = write_daily_report(self.artifacts.run_dir, self.manifest.data, recommendations, log_window=(start, end))
+            self.manifest.set_output("daily_report_md", str(md_path))
+            self.manifest.set_output("daily_report_json", str(json_path))
+            self.events.emit("full", "INFO", "stage_completed", "full pipeline completed", {"report": str(md_path), "report_json": str(json_path)})
+        finally:
+            keepalive.stop()
+            self.events.emit("full", "INFO", "keepalive_stopped", "firewall session keepalive stopped")
         if report:
             print_console_report(self.artifacts.run_dir)
 
@@ -617,15 +991,26 @@ class PipelineRunner:
         if not sip_health.get("healthy"):
             raise ApplyGuardError("apply requires healthy SIP session")
         if not firewall_health.get("healthy"):
-            raise ApplyGuardError("apply requires healthy firewall session")
+            raise ApplyGuardError(
+                "apply requires a healthy firewall session "
+                f"(status {firewall_health.get('status')}, login_page={bool(firewall_health.get('login_page'))}); "
+                "刷新会话文件中的 cookie 与 csrf._cftoken 后重跑 export-firewall-blacklist → analyze → block"
+            )
         run_path = self.artifacts.run_dir.resolve()
         rec_path = Path(recommendations).resolve()
         external_recommendations = explicit_recommendations and run_path not in rec_path.parents
         if not external_recommendations:
-            for required_stage in ("export-logs", "export-firewall-blacklist", "analyze"):
+            # 允许 firewall-phase 复用已导出数据：只要本 run 的 analyze 记录了所用导出的
+            # sha256（inputs.sip_xlsx），就不强制本 run 自己跑过 export-logs。
+            sip_input = (self.manifest.data.get("inputs") or {}).get("sip_xlsx") or {}
+            required_stages = ["export-firewall-blacklist", "analyze"]
+            if not sip_input.get("sha256"):
+                required_stages.insert(0, "export-logs")
+            for required_stage in required_stages:
                 stage_data = self.manifest.data.get("stages", {}).get(required_stage, {})
                 if stage_data.get("status") != "completed":
-                    raise ApplyGuardError(f"apply requires completed same-run {required_stage}")
+                    hint = "（或改用 firewall-phase 复用已导出数据）" if required_stage == "export-logs" else ""
+                    raise ApplyGuardError(f"apply requires completed same-run {required_stage}{hint}")
             expected = (self.artifacts.analysis_dir / "blocklist_recommendations.normalized.csv").resolve()
             if rec_path != expected:
                 raise ApplyGuardError("apply requires same-run normalized recommendations")

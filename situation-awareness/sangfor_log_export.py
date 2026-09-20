@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import math
 import os
+import re
+import time
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -14,7 +19,7 @@ from typing import Callable, Iterable
 from urllib.parse import urlencode, urlparse
 
 from openpyxl import load_workbook
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import Error, BrowserContext, Page, sync_playwright
 
 DEFAULT_BASE_URL = "https://sip.local"
 DEFAULT_OUTPUT_DIR = Path.home() / "sangfor-exports"
@@ -208,8 +213,156 @@ def effective_split_limit(export_limit: int) -> int:
     return max(1, int(export_limit * 0.95))
 
 
+INVALID_XML_BYTES = re.compile(
+    rb"[\x00-\x08\x0b\x0c\x0e-\x1f]"           # XML 1.0 禁止的 C0 控制字符
+    rb"|\xef\xbf[\xbe\xbf]"                     # U+FFFE / U+FFFF
+    rb"|\xef\xb7[\x90-\xaf]"                    # U+FDD0..U+FDEF（非字符）
+    rb"|[\xf0-\xf4][\x80-\xbf]\xbf[\xbe\xbf]"   # 补充平面非字符（低 16 位为 FFFE/FFFF）
+)
+"""Bytes that XML 1.0 forbids. SIP 会把原始载荷按有损方式解码后写进 sharedStrings，
+实测出现过 U+FFFF 与 U+FDD0..U+FDEF 非字符（2026-09-11 那次 export-logs 失败的真因）。"""
+DOWNLOAD_TIMEOUT_MS = 900_000
+DOWNLOAD_ATTEMPTS = int(os.environ.get("SANGFOR_EXPORT_ATTEMPTS", "3"))
+DOWNLOAD_BACKOFF_SECONDS = (3, 10, 20)
+
+
+def _xml_is_wellformed(data: bytes) -> str | None:
+    """Return the parse error when the XML payload is not well-formed, else None."""
+    try:
+        parser = ET.iterparse(io.BytesIO(data))
+        for _ in parser:
+            pass
+    except ET.ParseError as exc:
+        return str(exc)
+    return None
+
+
+def workbook_problem(path: str | Path) -> str | None:
+    """Return a human-readable reason when the downloaded workbook is unusable, else None."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return "downloaded workbook is missing or empty"
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        return f"not a readable xlsx zip ({exc})"
+    with archive:
+        names = archive.namelist()
+        if "xl/workbook.xml" not in names:
+            return "downloaded workbook is incomplete: xl/workbook.xml is missing"
+        if not any(name.startswith("xl/worksheets/") and name.endswith(".xml") for name in names):
+            return "downloaded workbook is incomplete: no worksheet part"
+        if "[Content_Types].xml" in names:
+            declared = re.findall(
+                r'PartName="([^"]+)"',
+                archive.read("[Content_Types].xml").decode("utf-8", "replace"),
+            )
+            missing = [part for part in declared if part.lstrip("/") not in names]
+            if missing:
+                return f"downloaded workbook is incomplete: declared parts missing ({', '.join(missing[:3])})"
+        broken = archive.testzip()
+        if broken:
+            return f"zip member is corrupt: {broken}"
+        for name in names:
+            if not (name.endswith(".xml") or name.endswith(".rels")):
+                continue
+            data = archive.read(name)
+            if INVALID_XML_BYTES.search(data):
+                return f"{name} contains bytes that XML 1.0 forbids"
+            error = _xml_is_wellformed(data)
+            if error:
+                return f"{name} is not well-formed XML ({error})"
+    return None
+
+
+def repair_workbook_in_place(path: str | Path) -> list[str]:
+    """Strip bytes that XML 1.0 forbids from every XML member. Returns the repaired member names."""
+    path = Path(path)
+    repaired: list[str] = []
+    tmp_path = path.with_name(path.name + ".repairing")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename.endswith(".xml"):
+                hits = INVALID_XML_BYTES.findall(data)
+                if hits:
+                    data = INVALID_XML_BYTES.sub(b"", data)
+                    repaired.append(f"{item.filename} ({len(hits)} 处非法字符)")
+            target.writestr(item, data)
+    if repaired:
+        tmp_path.replace(path)
+    else:
+        tmp_path.unlink(missing_ok=True)
+    return repaired
+
+
+def ensure_readable_workbook(path: str | Path) -> str | None:
+    """Validate the download; strip XML-invalid bytes in place when that is the only problem.
+
+    Returns a note describing the repair, or None when the file was already clean.
+    """
+    problem = workbook_problem(path)
+    if problem is None:
+        return None
+    try:
+        repaired = repair_workbook_in_place(path)
+    except Exception as exc:  # noqa: BLE001 - the zip itself is unreadable
+        raise RuntimeError(f"downloaded workbook is unusable ({problem}) and cannot be repaired: {exc}") from exc
+    problem_after = workbook_problem(path)
+    if problem_after is not None:
+        raise RuntimeError(
+            f"downloaded workbook is still unusable after repair: {problem_after} (initial problem: {problem})"
+        )
+    return f"stripped XML-invalid bytes from {', '.join(repaired)}" if repaired else f"recovered from: {problem}"
+
+
+def download_candidate_with_retry(
+    export_candidate: Callable[[Segment, Path], str],
+    segment: Segment,
+    candidate_path: Path,
+    *,
+    attempts: int = DOWNLOAD_ATTEMPTS,
+) -> str:
+    """Download one segment, verifying the workbook; retry transient/corrupt downloads.
+
+    Corrupt downloads are preserved next to the candidate as ``*.bad<N>.xlsx`` for forensics.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        candidate_path.unlink(missing_ok=True)
+        try:
+            server_file = export_candidate(segment, candidate_path)
+            note = ensure_readable_workbook(candidate_path)
+            if note:
+                print(f"REPAIRED {segment.start:%Y-%m-%d %H:%M:%S} -> {segment.end:%Y-%m-%d %H:%M:%S}: {note}", flush=True)
+            return server_file
+        except Exception as exc:  # noqa: BLE001 - report and retry
+            last_error = exc
+            if candidate_path.exists():
+                keep_path = candidate_path.with_name(f"{candidate_path.stem}.bad{attempt}.xlsx")
+                candidate_path.replace(keep_path)
+                print(
+                    f"RETRY download {segment.start:%Y-%m-%d %H:%M:%S} -> {segment.end:%Y-%m-%d %H:%M:%S}: "
+                    f"attempt {attempt}/{attempts} failed ({exc}); kept {keep_path.name}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"RETRY download {segment.start:%Y-%m-%d %H:%M:%S} -> {segment.end:%Y-%m-%d %H:%M:%S}: "
+                    f"attempt {attempt}/{attempts} failed ({exc})",
+                    flush=True,
+                )
+            if attempt < attempts:
+                time.sleep(DOWNLOAD_BACKOFF_SECONDS[min(attempt - 1, len(DOWNLOAD_BACKOFF_SECONDS) - 1)])
+    raise RuntimeError(
+        f"segment download failed after {attempts} attempts "
+        f"({segment.start:%Y-%m-%d %H:%M:%S} -> {segment.end:%Y-%m-%d %H:%M:%S}): {last_error}"
+    )
+
+
 def count_export_rows(path: str | Path) -> int:
     """Count non-empty data rows below SIP's seven preamble rows and header."""
+    ensure_readable_workbook(path)
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         sheet = workbook.active
@@ -236,8 +389,7 @@ def adaptive_export_segments(
     try:
         while pending:
             segment = pending.pop(0)
-            candidate_path.unlink(missing_ok=True)
-            server_file = export_candidate(segment, candidate_path)
+            server_file = download_candidate_with_retry(export_candidate, segment, candidate_path)
             actual_count = row_counter(candidate_path)
 
             if actual_count >= export_limit:
@@ -350,39 +502,44 @@ class SangforExporter:
 
         query = urlencode({"file": server_file, "xid": self.xid, "feature_id": "/logsearch"})
         download_url = f"{self.base_url}/apps/asset/branch_view/branch_view/on_download?{query}"
-        result = self.page.evaluate(
-            """
-            async ({downloadUrl, xid}) => {
-                const response = await fetch(downloadUrl, {
-                    method: 'GET',
-                    credentials: 'include',
-                    headers: {
-                        'xid': xid,
-                        'feature_id': '/logsearch',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    }
-                });
-                const buffer = await response.arrayBuffer();
-                const bytes = new Uint8Array(buffer);
-                let binary = '';
-                for (const byte of bytes) binary += String.fromCharCode(byte);
-                return {
-                    status: response.status,
-                    ok: response.ok,
-                    contentType: response.headers.get('content-type') || '',
-                    bodyBase64: btoa(binary)
-                };
-            }
-            """,
-            {"downloadUrl": download_url, "xid": self.xid},
+        # 在 Python 侧直接取字节：大段落经 page.evaluate 的 base64/CDP 传输会被截断，
+        # 是 2026-09-11 那次 export-logs 失败的直接成因之一。
+        # 注意：SIP 的 on_download 端点强制校验浏览器同源来源，缺 Referer 会返回
+        # {"message":"CSRF Protection","success":false}（2026-09-11 实测：加 Referer 即恢复）。
+        response = self.page.context.request.get(
+            download_url,
+            headers={
+                "xid": self.xid,
+                "feature_id": "/logsearch",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_url}/ui/",
+            },
+            timeout=DOWNLOAD_TIMEOUT_MS,
+            fail_on_status_code=False,
         )
-        body = base64.b64decode(result["bodyBase64"])
-        if not result["ok"]:
-            raise RuntimeError(f"download failed: HTTP {result['status']} {body[:200]!r}")
+        body = response.body()
+        if response.status != 200:
+            raise RuntimeError(f"download failed: HTTP {response.status} {body[:200]!r}")
         if not body.startswith(b"PK"):
             raise RuntimeError(f"download is not an xlsx file: {body[:80]!r}")
         output_path.write_bytes(body)
         return server_file
+
+
+def launch_chromium(playwright, *, headless: bool = True):
+    """启动 Chromium：优先用默认（headless shell），可执行文件缺失时回落到完整 chromium。
+
+    2026-09-20 实测：本机 Playwright 1.61 默认要 `chromium_headless_shell-1228`，但只装了 1223 版，
+    默认启动会直接 `Executable doesn't exist`；改用 `channel="chromium"`（完整 chromium-1228）
+    无需额外下载即可正常运行，因此做成自动回落，避免导出阶段被浏览器版本卡死。
+    """
+    args = ["--ignore-certificate-errors"]
+    try:
+        return playwright.chromium.launch(headless=headless, args=args)
+    except Error as exc:  # noqa: F821 - 由调用方导入的 playwright 错误类型
+        if "Executable doesn't exist" not in str(exc):
+            raise
+        return playwright.chromium.launch(headless=headless, channel="chromium", args=args)
 
 
 def make_context(browser, base_url: str, cookie_header: str) -> BrowserContext:
@@ -401,7 +558,7 @@ def export_logs(args: argparse.Namespace) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=["--ignore-certificate-errors"])
+        browser = launch_chromium(playwright)
         try:
             context = make_context(browser, base_url, cookie)
             page = context.new_page()

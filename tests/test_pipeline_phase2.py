@@ -43,6 +43,23 @@ class _DummyConfig:
         self.paths = _DummyPaths(root)
 
 
+class NoopFirewallKeepalive:
+    """测试替身：不真正拉起 firewall_keepalive.py 子进程。"""
+
+    def __init__(self, *args, **kwargs):
+        self.command = []
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    @property
+    def running(self) -> bool:
+        return False
+
+
 def test_redaction_removes_headers_json_fields_and_cli_values():
     payload = (
         "Cookie: SESSID=abc; Set-Cookie: token=def\n"
@@ -835,13 +852,15 @@ def test_full_apply_runs_dry_run_before_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "analyze", lambda xlsx, blacklist, *, persist_history=False: calls.append(("analyze", persist_history)) or recommendations)
     monkeypatch.setattr(runner, "block", lambda recs, *, apply=False, manual_override_reason=None: calls.append(("block", apply)) or ["1.1.1.1"])
     monkeypatch.setattr("pipeline.run_pipeline.write_daily_report", lambda *args, **kwargs: (tmp_path / "report.md", tmp_path / "report.json"))
+    monkeypatch.setattr("pipeline.run_pipeline.FirewallKeepalive", NoopFirewallKeepalive)
 
     runner.full("2026-07-06 00:00:00", "2026-07-06 23:59:59", None, None, apply=True)
 
+    # 黑名单导出排在 SIP 长导出之前（否则防火墙会话会在导出期间空闲超时）
     assert calls == [
         ("check_sessions", None),
-        ("export_logs", None),
         ("export_firewall_blacklist", None),
+        ("export_logs", None),
         ("analyze", True),
         ("block", False),
         ("block", True),
@@ -861,6 +880,7 @@ def test_full_dry_run_does_not_persist_analysis_history(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "analyze", lambda xlsx, blacklist, *, persist_history=False: calls.append(("analyze", persist_history)) or recommendations)
     monkeypatch.setattr(runner, "block", lambda recs, *, apply=False, manual_override_reason=None: calls.append(("block", apply)) or ["1.1.1.1"])
     monkeypatch.setattr("pipeline.run_pipeline.write_daily_report", lambda *args, **kwargs: (tmp_path / "report.md", tmp_path / "report.json"))
+    monkeypatch.setattr("pipeline.run_pipeline.FirewallKeepalive", NoopFirewallKeepalive)
 
     runner.full("2026-07-06 00:00:00", "2026-07-06 23:59:59", None, None, apply=False)
 
