@@ -179,15 +179,30 @@ def is_login_page_info(info: dict) -> bool:
     )
 
 
-def keepalive_loop(page, base_url: str, interval: int) -> None:
-    print(f"Keepalive started: interval={interval}s", flush=True)
+def keepalive_loop(page, base_url: str, interval: int, *, path: str = "/framework.php", max_consecutive_failures: int = 3) -> None:
+    """登录后不关 browser context，周期性刷新认证页面以维持会话。
+
+    2026-09-20 实测修正两个坑：
+    1. `wait_until="networkidle"` 在防火墙控制台上**永远到不了**（会话健康也照样 60s 超时），
+       于是第一次刷新就退出，保活静默失效——改用 `domcontentloaded`。
+    2. 单次导航超时 ≠ 会话失效：连续超时单独计数，达到上限才退出；只有真的落到登录页才立即退出。
+    默认刷新 `/framework.php`（不要用 `/`，它不校验登录态）。
+    """
+    target = base_url.rstrip("/") + path
+    print(f"Keepalive started: interval={interval}s target={target}", flush=True)
+    failures = 0
     while True:
         time.sleep(interval)
         try:
-            page.goto(base_url.rstrip("/"), wait_until="networkidle", timeout=60000)
+            page.goto(target, wait_until="domcontentloaded", timeout=60000)
         except Exception as exc:
-            print(f"Keepalive failed during refresh: {exc}", flush=True)
-            raise SystemExit(1)
+            failures += 1
+            print(f"Keepalive refresh error ({failures}/{max_consecutive_failures}): {exc}", flush=True)
+            if failures >= max_consecutive_failures:
+                print("Keepalive stopped: repeated refresh failures", flush=True)
+                raise SystemExit(1)
+            continue
+        failures = 0
         info = page_login_info(page)
         if is_login_page_info(info):
             print(f"Keepalive stopped: session is no longer authenticated; url={info.get('url')}", flush=True)
@@ -252,7 +267,13 @@ def login(args: argparse.Namespace) -> dict:
             session_path.chmod(0o600)
             print(f"Session written: {session_path}")
             if args.keepalive:
-                keepalive_loop(page, args.base_url, args.keepalive_interval)
+                keepalive_loop(
+                    page,
+                    args.base_url,
+                    args.keepalive_interval,
+                    path=args.keepalive_path,
+                    max_consecutive_failures=args.keepalive_max_failures,
+                )
             return session
         finally:
             browser.close()
@@ -270,6 +291,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-executable", help="Use an existing Chromium/Chrome executable instead of Playwright's bundled headless shell")
     parser.add_argument("--keepalive", action=argparse.BooleanOptionalAction, default=True, help="Keep Playwright open and refresh periodically after login")
     parser.add_argument("--keepalive-interval", type=int, default=300, help="Seconds between keepalive refreshes")
+    parser.add_argument("--keepalive-path", default="/framework.php",
+                        help="Authenticated path refreshed by the keepalive loop (default: /framework.php)")
+    parser.add_argument("--keepalive-max-failures", type=int, default=3,
+                        help="Exit after this many consecutive refresh timeouts (default: 3)")
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     return parser
 

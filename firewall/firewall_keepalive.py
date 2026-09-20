@@ -93,6 +93,28 @@ def framework_url(base_url: str, framework_path: str) -> str:
     return base_url.rstrip("/") + "/" + framework_path.lstrip("/")
 
 
+def refresh_once(page, target: str, timeout: float) -> tuple[str, str, str]:
+    """刷新一次 `/framework.php`，返回 (verdict, message, url)。
+
+    2026-09-20 实测：用 `wait_until="networkidle"` 时，**会话明明是活的**，防火墙控制台页面
+    也永远到不了 networkidle，于是第一次刷新就 45s 超时——保活脚本会立刻退出，容器表现为
+    “常驻但什么都没做”。所以改为 `domcontentloaded`，并把“导航超时”与“会话失效”区分开：
+
+    - `("ok", "", url)`       页面仍在认证后的框架内；
+    - `("expired", msg, url)` 落到登录页 → 会话真的失效，调用方应退出；
+    - `("retry", msg, "")`    导航超时/异常 → 不代表会话失效，调用方应重试。
+    """
+    try:
+        page.goto(target, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+    except Exception as exc:  # noqa: BLE001 - 超时/网络抖动都归入 retry
+        return "retry", f"refresh failed: {exc}", ""
+    info = page_login_info(page)
+    url = str(info.get("url", ""))
+    if is_login_page_info(info):
+        return "expired", "login page detected", url
+    return "ok", "", url
+
+
 def run_keepalive(args: argparse.Namespace) -> int:
     session = load_session_file(args.session_file)
     target = framework_url(session["base_url"], args.framework_path)
@@ -105,6 +127,7 @@ def run_keepalive(args: argparse.Namespace) -> int:
             context.add_cookies(cookies)
             page = context.new_page()
             attempt = 0
+            failures = 0
             next_t = time.monotonic()
             while not STOP:
                 now = time.monotonic()
@@ -112,19 +135,21 @@ def run_keepalive(args: argparse.Namespace) -> int:
                     time.sleep(min(0.5, next_t - now))
                     continue
                 attempt += 1
-                try:
-                    page.goto(target, wait_until="networkidle", timeout=int(args.timeout * 1000))
-                    info = page_login_info(page)
-                except Exception as exc:
-                    write_status(args.status_file, ok=False, session_file=args.session_file, message=f"refresh failed: {exc}")
-                    print(f"[{_now_iso()}] #{attempt} refresh failed: {exc}", flush=True)
-                    return 1
-                if is_login_page_info(info):
-                    url = str(info.get("url", ""))
-                    write_status(args.status_file, ok=False, session_file=args.session_file, message="login page detected", url=url)
+                verdict, message, url = refresh_once(page, target, args.timeout)
+                if verdict == "expired":
+                    write_status(args.status_file, ok=False, session_file=args.session_file, message=message, url=url)
                     print(f"[{_now_iso()}] #{attempt} login page detected url={url}", flush=True)
                     return 1
-                url = str(info.get("url", ""))
+                if verdict == "retry":
+                    failures += 1
+                    write_status(args.status_file, ok=False, session_file=args.session_file, message=message)
+                    print(f"[{_now_iso()}] #{attempt} {message} (consecutive={failures})", flush=True)
+                    if failures >= args.max_consecutive_failures:
+                        print(f"[{_now_iso()}] giving up after {failures} consecutive failures", flush=True)
+                        return 1
+                    next_t += args.interval
+                    continue
+                failures = 0
                 write_status(args.status_file, ok=True, session_file=args.session_file, message="framework refresh ok", url=url)
                 print(f"[{_now_iso()}] #{attempt} framework refresh ok url={url}", flush=True)
                 next_t += args.interval
@@ -143,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", type=int, default=300, help="Seconds between refreshes")
     parser.add_argument("--timeout", type=float, default=60.0, help="Per-refresh timeout seconds")
     parser.add_argument("--insecure", action=argparse.BooleanOptionalAction, default=True, help="Ignore TLS certificate errors")
+    parser.add_argument("--max-consecutive-failures", type=int, default=3,
+                        help="Exit after this many consecutive refresh timeouts/errors (default: 3)")
     return parser
 
 
